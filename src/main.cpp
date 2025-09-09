@@ -1,416 +1,280 @@
-#include <Arduino.h>
-#include <mcp_can.h>
 #include <SPI.h>
+#include <mcp_can.h>
 #include <M5Unified.h>
-#include "Robstride.h" // 作成したライブラリをインクルード
+#include "RS02PrivateCAN.h"
 
-// --- ユーザー設定項目 ---
-// お使いのESP32-S3とMCP2515の接続に合わせてピン番号を変更してください
-const int SPI_CS_PIN = 6; // 例: GPIO 5
-const int INT_PIN = 4;    // MCP2515の割り込みピン (メッセージ受信時にLOWになる)
+// ====== ハード設定 ======
+#define CAN_CS_PIN 6
+// MCP2515 の水晶に合わせて切り替え（多くは 16MHz です）
+#define MCP_CLOCK MCP_8MHZ // 16MHz の場合は MCP_16MHZ
+#define CAN_BAUD CAN_1000KBPS
 
-// モーター側で設定したCAN ID (1~15)
-const byte MOTOR_ID = 1;
+MCP_CAN CAN(CAN_CS_PIN);
+RS02PrivateCAN RS(CAN, /*hostId*/ 0xFD);
 
-// ホスト(このESP32)のCAN ID。モーターはこのID宛に返信します。
-// 他のCANデバイスと重複しない値を設定してください。
-const byte HOST_ID = 0x0A;
+// ====== 動作用の設定 ======
+constexpr uint8_t MOTOR_ID = 0x7F; // まずは1から試す
+bool activeReportOn = false;
 
-// --- グローバル変数 ---
-MCP_CAN CAN0(SPI_CS_PIN);
-Robstride motor(CAN0, MOTOR_ID, HOST_ID); // ホストIDを渡して初期化
+// ====== 操作用の状態 ======
+uint8_t modeState = 0; // 0:pos, 1:velocity, 2:current, 3:CSP
+uint8_t posState = 0;  // 0:90度, 1:0度, 2:-90度
+uint32_t lastOpMs = 0;
+const char *modeNames[] = {"Position", "Velocity", "Current", "CSP"};
 
-unsigned long prev_command_time = 0;
-unsigned long prev_display_update = 0;
-int communication_count = 0;
-unsigned long last_communication_time = 0;
-bool motor_connected = false;
+// ====== 画面ログユーティリティ ======
+int lineHeight = 14;
 
-// モータースキャン用の変数
-bool scan_mode = true;
-byte current_scan_id = 1;
-unsigned long scan_start_time = 0;
-unsigned long scan_timeout = 2000; // 各IDのスキャンタイムアウト（ms）
-bool found_motors[16] = {false};   // 見つかったモーターID（1-15）
-byte active_motor_id = 0;
-
-// モータースキャン関数
-void scanMotor(byte motor_id)
+void drawHeader(const char *status, uint16_t color = CYAN)
 {
-  // モーターに有効化コマンドを送信
-  byte data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
-  CAN0.sendMsgBuf(motor_id, 0, 8, data);
-  scan_start_time = millis();
+  auto &D = M5.Display;
+  D.fillRect(0, 0, D.width(), 28, BLACK);
+  D.setTextColor(color, BLACK);
+  D.setCursor(0, 0);
+  D.printf("RS02 Private Debug  |  Mode: %s  |  %s\n", modeNames[modeState], status);
+  D.setTextColor(WHITE, BLACK);
+  D.drawLine(0, 28, D.width(), 28, 0x7BEF);
+  D.setCursor(0, 30);
+}
+void logLine(const String &s, uint16_t color = WHITE)
+{
+  Serial.println(s);
+  auto &D = M5.Display;
+  int y = D.getCursorY();
+  if (y > D.height() - lineHeight)
+  {
+    D.fillRect(0, 30, D.width(), D.height() - 30, BLACK); // 下部ログエリアだけ消す
+    D.setCursor(0, 30);
+  }
+  D.setTextColor(color, BLACK);
+  D.println(s);
 }
 
-// スキャン結果をチェック
-bool checkScanResponse()
+// ====== 受信フレームの表示 ======
+void showRawFrame(const RS02PrivFrame &f)
 {
-  if (!digitalRead(INT_PIN))
-  {
-    long unsigned int rxId;
-    byte len = 0;
-    byte rxBuf[8];
-
-    CAN0.readMsgBuf(&rxId, &len, rxBuf);
-
-    // ホストID宛の返信で、現在スキャン中のIDと一致する場合
-    if (rxId == HOST_ID && len >= 6 && rxBuf[0] == current_scan_id)
-    {
-      found_motors[current_scan_id] = true;
-      if (active_motor_id == 0)
-      {
-        active_motor_id = current_scan_id;
-      }
-      return true;
-    }
-  }
-  return false;
+  String s = String(f.isExt ? "[EXT]" : "[STD]") + " ID=0x" + String(f.id, HEX) + " DLC=" + String(f.dlc) + " Data:";
+  for (int i = 0; i < f.dlc; i++)
+    s += " " + String(f.data[i], HEX);
+  logLine(s, 0xCFFF);
 }
 
-// スキャンディスプレイ更新関数
-void updateScanDisplay()
-{
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextSize(1);
-
-  M5.Display.setCursor(10, 10);
-  M5.Display.println("Motor ID Scanner");
-  M5.Display.println("================");
-
-  M5.Display.setCursor(10, 40);
-  M5.Display.print("Scanning ID: ");
-  M5.Display.println(current_scan_id);
-
-  M5.Display.setCursor(10, 60);
-  M5.Display.print("Timeout: ");
-  M5.Display.print((scan_timeout - (millis() - scan_start_time)) / 1000);
-  M5.Display.println("s");
-
-  M5.Display.setCursor(10, 80);
-  M5.Display.println("Found Motors:");
-
-  int y_pos = 100;
-  for (int i = 1; i <= 15; i++)
-  {
-    if (found_motors[i])
-    {
-      M5.Display.setCursor(10, y_pos);
-      M5.Display.setTextColor(GREEN);
-      M5.Display.print("ID ");
-      M5.Display.print(i);
-      M5.Display.println(": FOUND");
-      y_pos += 15;
-    }
-  }
-
-  if (active_motor_id > 0)
-  {
-    M5.Display.setTextColor(YELLOW);
-    M5.Display.setCursor(10, 200);
-    M5.Display.print("Active Motor: ID ");
-    M5.Display.println(active_motor_id);
-  }
-}
-
-// ディスプレイ更新関数
-void updateDisplay()
-{
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextSize(1);
-
-  // 通信状況の表示
-  M5.Display.setCursor(10, 10);
-  M5.Display.print("Comm Count: ");
-  M5.Display.println(communication_count);
-
-  M5.Display.setCursor(10, 30);
-  if (motor_connected)
-  {
-    M5.Display.setTextColor(GREEN);
-    M5.Display.println("Motor: CONNECTED");
-  }
-  else
-  {
-    M5.Display.setTextColor(RED);
-    M5.Display.println("Motor: DISCONNECTED");
-  }
-
-  // 最後の通信時刻
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setCursor(10, 50);
-  M5.Display.print("Last Comm: ");
-  M5.Display.print((millis() - last_communication_time) / 1000);
-  M5.Display.println("s ago");
-
-  // モーターの状態
-  M5.Display.setCursor(10, 70);
-  M5.Display.print("Pos: ");
-  M5.Display.print(motor.getPosition(), 3);
-  M5.Display.println(" rad");
-
-  M5.Display.setCursor(10, 90);
-  M5.Display.print("Vel: ");
-  M5.Display.print(motor.getVelocity(), 3);
-  M5.Display.println(" rad/s");
-
-  M5.Display.setCursor(10, 110);
-  M5.Display.print("Torque: ");
-  M5.Display.print(motor.getTorque(), 3);
-  M5.Display.println(" Nm");
-}
-
+// ====== 初期化 ======
 void setup()
 {
+  auto cfg = M5.config();
+  M5.begin(cfg);
+  M5.Display.setTextSize(1);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.fillScreen(BLACK);
+  drawHeader("Booting...");
+
   Serial.begin(115200);
   while (!Serial)
-    ; // シリアルモニタが開くまで待機
-
-  // M5Stackの初期化
-  M5.begin();
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 10);
-  M5.Display.println("Robstride Motor Control");
-
-  Serial.println("Robstride Motor Control Example (Verified with Datasheet)");
-
-  // MCP2515の初期化
-  // CANレート: 1Mbps, 水晶発振子: 8MHz (データシート推奨)
-  if (CAN0.begin(MCP_ANY, CAN_1000KBPS, MCP_8MHZ) == CAN_OK)
   {
-    Serial.println("MCP2515 Initialized Successfully!");
-    // CAN初期化成功時はディスプレイを緑色に
-    M5.Display.fillScreen(GREEN);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 10);
-    M5.Display.println("CAN Init: SUCCESS");
-    M5.Display.setCursor(10, 40);
-    M5.Display.println("Motor Control Ready");
   }
-  else
+
+  // MCP2515 初期化
+  while (CAN.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) != CAN_OK)
   {
-    Serial.println("Error Initializing MCP2515. Check wiring.");
-    // CAN初期化失敗時はディスプレイを赤色に
-    M5.Display.fillScreen(RED);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 10);
-    M5.Display.println("CAN Init: FAILED");
-    M5.Display.setCursor(10, 40);
-    M5.Display.println("Check wiring!");
-    while (1)
-      ;
+    drawHeader("MCP2515 init FAIL (retry)", RED);
+    delay(300);
   }
-  CAN0.setMode(MCP_NORMAL);
+  CAN.setMode(MCP_NORMAL);
+  drawHeader("MCP2515 init OK", GREEN);
 
-  // 割り込みピンを入力に設定
-  pinMode(INT_PIN, INPUT);
+  RS.begin();
 
-  Serial.println("Starting motor ID scan...");
-
-  // --- デバイスIDの取得デモ ---
-  Serial.println("Requesting MCU Unique ID...");
-
-  // M5ディスプレイにデバイスID取得中を表示
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 10);
-  M5.Display.println("Getting Device ID...");
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(10, 50);
-  M5.Display.println("Please wait...");
-
-  motor.requestDeviceID();
-
-  unsigned long startTime = millis();
-  bool idReceived = false;
-  while (millis() - startTime < 500)
-  { // 500ms待機
-    if (!digitalRead(INT_PIN))
-    {
-      long unsigned int rxId;
-      byte len = 0;
-      byte rxBuf[8];
-      CAN0.readMsgBuf(&rxId, &len, rxBuf);
-      if (motor.parseReply(rxId, len, rxBuf))
-      {
-        if (motor.getMCUUniqueID() != 0)
-        {
-          idReceived = true;
-          break;
-        }
-      }
-    }
-  }
-
-  // M5ディスプレイに結果を表示
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 10);
-  M5.Display.println("Device ID Result");
-  M5.Display.println("================");
-
-  if (idReceived)
-  {
-    M5.Display.setTextColor(GREEN);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 50);
-    M5.Display.println("MCU Unique ID Received:");
-
-    uint32_t high = motor.getMCUUniqueID() >> 32;
-    uint32_t low = motor.getMCUUniqueID() & 0xFFFFFFFF;
-
-    M5.Display.setCursor(10, 70);
-    M5.Display.print("0x");
-    if (high > 0)
-    {
-      M5.Display.print(high, HEX);
-    }
-    M5.Display.println(low, HEX);
-
-    // シリアルにも出力
-    Serial.print("MCU Unique ID Received: 0x");
-    if (high > 0)
-      Serial.print(high, HEX);
-    Serial.println(low, HEX);
-  }
-  else
-  {
-    M5.Display.setTextColor(RED);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 50);
-    M5.Display.println("Failed to receive");
-    M5.Display.setCursor(10, 70);
-    M5.Display.println("MCU Unique ID");
-
-    Serial.println("Failed to receive MCU Unique ID.");
-  }
-
-  // 3秒間表示してからスキャンに移行
-  delay(3000);
-  // --- デモ終了 ---
-
-  // スキャンモード開始
-  scanMotor(current_scan_id);
-  updateScanDisplay();
+  // Private Ping（応答があればPrivateで生存）
+  bool ok = RS.ping(MOTOR_ID);
+  logLine(ok ? "Ping TX OK" : "Ping TX FAIL", ok ? GREEN : RED);
 }
 
 void loop()
 {
-  if (scan_mode)
+  M5.update();
+
+  // --- ボタン操作 ---
+  if (M5.BtnA.wasPressed())
   {
-    // スキャンモード
-    // 1. スキャン応答をチェック
-    if (checkScanResponse())
+    bool ok = RS.enable(MOTOR_ID);
+    drawHeader(ok ? "Enable sent" : "Enable FAIL", ok ? GREEN : RED);
+    logLine(ok ? "Enable TX OK" : "Enable TX FAIL", ok ? GREEN : RED);
+  }
+  if (M5.BtnB.wasPressed())
+  {
+    bool ok = false;
+    modeState = (modeState + 1) & 0x03; // 0-3を循環（処理前に更新）
+    String modeStr = modeNames[modeState];
+
+    switch (modeState)
     {
-      Serial.print("Found motor with ID: ");
-      Serial.println(current_scan_id);
+    case 0: // Position mode (Operation Control)
+    {
+      float pos;
+      switch (posState)
+      {
+      case 0:
+        pos = 0.5f * PI; // +90度
+        break;
+      case 1:
+        pos = 0.0f; // 0度
+        break;
+      case 2:
+        pos = -0.5f * PI; // -90度
+        break;
+      }
+      float vmax = 6.0f, kp = 4.0f, kd = 1.0f;
+      ok = RS.opControl(MOTOR_ID, 0.0f, pos, vmax, kp, kd);
+      logLine(String("Position mode: pos=") + String(pos, 3) + " rad", ok ? CYAN : RED);
+      posState = (posState + 1) % 3; // 0-2を循環
+    }
+    break;
+
+    case 1: // Velocity mode
+    {
+      float velocity;
+      switch (posState)
+      {
+      case 0:
+        velocity = 5.0f; // 5 rad/s
+        break;
+      case 1:
+        velocity = 0.0f; // 0 rad/s (停止)
+        break;
+      case 2:
+        velocity = -5.0f; // -5 rad/s (逆回転)
+        break;
+      }
+      ok = RS.enterVelocityStrict(MOTOR_ID, 8.0f, 10.0f, 20.0f); // 8Nm制限, 10A制限, 20rad/s^2加速度
+      logLine(String("enterVelocityStrict: ") + (ok ? "OK" : "FAIL"), ok ? GREEN : RED);
+      if (ok)
+      {
+        delay(100); // 設定完了を待機
+        ok = RS.velocityRef(MOTOR_ID, velocity);
+        logLine(String("velocityRef: ") + (ok ? "OK" : "FAIL"), ok ? GREEN : RED);
+      }
+      logLine(String("Velocity mode: ") + String(velocity, 1) + " rad/s", ok ? CYAN : RED);
+      posState = (posState + 1) % 3; // 0-2を循環
+    }
+    break;
+
+    case 2: // Current mode
+    {
+      ok = RS.enterCurrent(MOTOR_ID, 5.0f); // 5Nm制限
+      if (ok)
+      {
+        ok = RS.currentIqRef(MOTOR_ID, 2.0f); // 2A
+      }
+      logLine("Current mode: 2.0A", ok ? CYAN : RED);
+    }
+    break;
+
+    case 3: // CSP mode
+    {
+      ok = RS.enterCSP(MOTOR_ID, 5.0f, 10.0f); // 5rad/s制限, 10A制限
+      if (ok)
+      {
+        ok = RS.cspLocRef(MOTOR_ID, 1.0f); // 1 rad位置
+      }
+      logLine("CSP mode: 1.0 rad position", ok ? CYAN : RED);
+    }
+    break;
     }
 
-    // 2. タイムアウトチェック
-    if (millis() - scan_start_time > scan_timeout)
+    drawHeader(ok ? String("Mode: " + modeStr).c_str() : "Mode FAIL", ok ? CYAN : RED);
+    lastOpMs = millis();
+  }
+  if (M5.BtnC.wasPressed())
+  {
+    bool ok = RS.stop(MOTOR_ID, /*clearFault*/ true);
+    drawHeader(ok ? "Stop + FaultClear" : "Stop FAIL", ok ? 0xFFE0 : RED);
+    logLine(ok ? "Stop&Clear TX OK" : "Stop TX FAIL", ok ? 0xFFE0 : RED);
+  }
+
+  // --- 受信処理 ---
+  RS02PrivFrame f;
+  while (RS.readAny(f))
+  {
+    // フィードバック(Type 2)ならパースして見やすく表示
+    RS02PrivateCAN::Feedback fb;
+    if (RS.parseFeedback(f, fb))
     {
-      // 次のIDに進む
-      current_scan_id++;
-      if (current_scan_id > 15)
+      char line[128];
+      snprintf(line, sizeof(line),
+               "[FB] id=%u mode=%u fault=0x%02X  pos=%.3f rad  vel=%.3f  tq=%.3f  T=%.1fC",
+               fb.motorId, fb.mode, fb.faultBits, fb.angleRad, fb.velRadS, fb.torqueNm, fb.tempC);
+      logLine(line, 0x7FFF);
+      // ヘッダにも簡易表示
+      char hdr[64];
+      snprintf(hdr, sizeof(hdr), "FB: pos %.2f rad | vel %.2f | T %.1fC", fb.angleRad, fb.velRadS, fb.tempC);
+      drawHeader(hdr, (fb.faultBits ? RED : GREEN));
+    }
+    else
+    {
+      // その他のフレームは生で表示
+      showRawFrame(f);
+    }
+  }
+
+  // --- 各モードでの継続制御コマンド送信 ---
+  if (millis() - lastOpMs >= 50)
+  { // 50ms間隔で継続送信
+    lastOpMs = millis();
+    bool ok = false;
+
+    switch (modeState)
+    {
+    case 0: // Position mode - 継続送信は不要（一度送信すればOK）
+      break;
+
+    case 1: // Velocity mode - 継続送信が必要
+    {
+      float velocity;
+      switch (posState)
       {
-        // スキャン完了
-        scan_mode = false;
-        if (active_motor_id > 0)
-        {
-          // 見つかったモーターで通常モードに移行
-          motor = Robstride(CAN0, active_motor_id, HOST_ID);
-          motor.enableMotor();
-          delay(1000);
-          Serial.print("Switching to normal mode with motor ID: ");
-          Serial.println(active_motor_id);
-        }
-        else
-        {
-          Serial.println("No motors found!");
-        }
+      case 0:
+        velocity = 5.0f; // 5 rad/s
+        break;
+      case 1:
+        velocity = 0.0f; // 0 rad/s (停止)
+        break;
+      case 2:
+        velocity = -5.0f; // -5 rad/s (逆回転)
+        break;
+      }
+      ok = RS.velocityRef(MOTOR_ID, velocity);
+      if (!ok)
+      {
+        logLine("Continuous velocityRef FAIL", RED);
       }
       else
       {
-        // 次のIDをスキャン
-        scanMotor(current_scan_id);
+        // デバッグ用：時々継続制御の成功を表示
+        static int debugCounter = 0;
+        if (++debugCounter >= 20)
+        { // 1秒に1回表示
+          logLine(String("Continuous velocity: ") + String(velocity, 1) + " rad/s", GREEN);
+          debugCounter = 0;
+        }
       }
     }
+    break;
 
-    // 3. スキャンディスプレイ更新
-    if (millis() - prev_display_update >= 200)
+    case 2: // Current mode - 継続送信が必要
+      ok = RS.currentIqRef(MOTOR_ID, 2.0f);
+      break;
+
+    case 3: // CSP mode - 継続送信が必要
+      ok = RS.cspLocRef(MOTOR_ID, 1.0f);
+      break;
+    }
+
+    if (modeState > 0 && !ok)
     {
-      prev_display_update = millis();
-      updateScanDisplay();
+      logLine("Continuous control FAIL", RED);
     }
   }
-  else
-  {
-    // 通常モード
-    // 1. CANメッセージの受信と解析
-    // INT_PINがLOWなら、MCP2515に受信メッセージあり
-    if (!digitalRead(INT_PIN))
-    {
-      long unsigned int rxId;
-      byte len = 0;
-      byte rxBuf[8];
 
-      CAN0.readMsgBuf(&rxId, &len, rxBuf);
-
-      // 受信したデータをライブラリに渡して解析させる
-      if (motor.parseReply(rxId, len, rxBuf))
-      {
-        // 正常にデータを解析できた場合
-        communication_count++;
-        last_communication_time = millis();
-        motor_connected = true;
-      }
-    }
-
-    // 2. 20ms周期 (50Hz) でモーターに指令を送信
-    if (millis() - prev_command_time >= 20)
-    {
-      prev_command_time = millis();
-
-      // 目標位置をサイン波で生成 (振幅 ±1.5 rad, 周期 5秒)
-      float time_sec = millis() / 1000.0f;
-      float target_pos = 1.5f * sin(2.0f * PI / 5.0f * time_sec);
-
-      // モーターへ位置指令を送信
-      // setPosition(目標位置[rad], 速度FF[rad/s], トルクFF[Nm], Kp, Kd)
-      // Kp, Kdはモーターや負荷に合わせて調整してください
-      motor.setPosition(target_pos, 0.0, 0.0, 8.0, 1.0);
-
-      // モーターの状態をシリアルモニタに出力
-      Serial.print("Target: ");
-      Serial.print(target_pos, 3);
-      Serial.print("\t Actual: ");
-      Serial.print(motor.getPosition(), 3);
-      Serial.print("\t Vel: ");
-      Serial.print(motor.getVelocity(), 3);
-      Serial.print("\t Torque: ");
-      Serial.println(motor.getTorque(), 3);
-    }
-
-    // 3. 500ms周期でディスプレイを更新
-    if (millis() - prev_display_update >= 500)
-    {
-      prev_display_update = millis();
-
-      // 5秒以上通信がない場合は切断とみなす
-      if (millis() - last_communication_time > 5000)
-      {
-        motor_connected = false;
-      }
-
-      updateDisplay();
-    }
-  }
+  delay(5);
 }
