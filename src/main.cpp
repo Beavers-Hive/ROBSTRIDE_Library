@@ -1,27 +1,19 @@
-// main.cpp — Velocity / PP / Current / CSP（robust）検証UI
+// main.cpp — mechPos(0x7019)/mechVel(0x701B) をType17で周期読出し→Angle∞をアンラップ表示
 // M5Unified + MCP2515(1Mbps) / mcp_can 4引数 readMsgBuf 版
-//
-// 操作：
-//  左(A)  … ステータス取得（CAN_MASTER / RUN_MODE）
-//  中(B)  … 選択モードの Bring-up & デモ指令
-//  右(C)  … Modeを Velocity→PP→Current→CSP→… とローテーション
-//
-// 表示は毎回スプライト全描画（重なり/見切れなし）
 
 #include <M5Unified.h>
 #include <SPI.h>
 #include <mcp_can.h>
 #include <stdarg.h>
+#include <math.h>
 #include "RS02PrivateCAN.h"
 
-// ===== CAN配線/設定 =====
 #define CAN_CS_PIN 6
 #define CAN_BAUD CAN_1000KBPS
-#define MCP_CLOCK MCP_8MHZ // 16MHz基板なら MCP_16MHZ
+#define MCP_CLOCK MCP_8MHZ // 基板に合わせて 16MHzなら MCP_16MHZ
 
-// ===== ノード設定 =====
 constexpr uint8_t HOST_ID = 0x00;
-constexpr uint8_t MOTOR_ID = 0x7F;
+constexpr uint8_t MOTOR_ID = 0x7E;
 
 MCP_CAN CAN(CAN_CS_PIN);
 RS02PrivateCAN RS(CAN, HOST_ID);
@@ -38,7 +30,40 @@ enum class Mode : uint8_t
   CSP = 3
 };
 Mode curMode = Mode::Velocity;
+bool monitorOn = true;
+uint32_t nextMonUpdate = 0;
 
+// ===== Angle∞ アンラップ =====
+struct AngleTracker
+{
+  bool has = false;
+  float prev = NAN;    // 直近の 0x7019 値（ラップ角）
+  double accRad = 0.0; // 累積角 [rad]
+} gAngle;
+
+static inline void angleTrackUpdateFromMechPos(float nowRad)
+{
+  if (!isfinite(nowRad))
+    return;
+  const float WRAP = 2.0f * (float)M_PI; // mechPos は 2π周期想定
+  if (!gAngle.has)
+  {
+    gAngle.has = true;
+    gAngle.prev = nowRad;
+    gAngle.accRad = nowRad;
+    return;
+  }
+  float d = nowRad - gAngle.prev;
+  // 最小差分へ折り返し（πが境目）
+  if (d > (float)M_PI)
+    d -= WRAP;
+  if (d < -(float)M_PI)
+    d += WRAP;
+  gAngle.accRad += (double)d;
+  gAngle.prev = nowRad;
+}
+
+// ===== 表示ユーティリティ =====
 static const char *modeName(Mode m)
 {
   switch (m)
@@ -54,23 +79,21 @@ static const char *modeName(Mode m)
   }
   return "?";
 }
-
 static void drawLayout()
 {
   spr.fillScreen(BLACK);
   spr.setTextSize(1);
   spr.setTextColor(WHITE, BLACK);
   spr.setCursor(PAD, PAD);
-  spr.printf("RS02 Multi-Mode Tester  HOST=0x%02X  MOTOR=0x%02X  MASTER=0x%02X\n",
+  spr.printf("RS02 Monitor  HOST=0x%02X  MOTOR=0x%02X  MASTER=0x%02X\n",
              HOST_ID, MOTOR_ID, RS.masterId());
   spr.setCursor(PAD, PAD + 16);
-  spr.printf("[A] Status  [B] Bring-up+Demo  [C] Mode=%s\n", modeName(curMode));
+  spr.printf("[A] Monitor %s  [B] Demo  [C] Mode=%s\n", monitorOn ? "ON" : "OFF", modeName(curMode));
   spr.drawRect(2, 40, W - 4, 192, 0x7BEF);
 }
-
 static void printLine(int row, const char *fmt, ...)
 {
-  char buf[230];
+  char buf[240];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -81,52 +104,82 @@ static void printLine(int row, const char *fmt, ...)
   spr.setTextColor(WHITE, BLACK);
   spr.print(buf);
 }
-
-// ===== 小ヘルパ =====
-static bool readU16(uint8_t node, uint16_t index, uint16_t &out)
+static bool readU8(uint8_t node, uint16_t idx, uint8_t &out)
 {
   uint8_t le[4] = {0};
-  if (!RS.readParamRaw(node, index, le))
-    return false;
-  out = (uint16_t)le[0] | ((uint16_t)le[1] << 8);
-  return true;
-}
-static bool readU8(uint8_t node, uint16_t index, uint8_t &out)
-{
-  uint8_t le[4] = {0};
-  if (!RS.readParamRaw(node, index, le))
+  if (!RS.readParamRaw(node, idx, le))
     return false;
   out = le[0];
   return true;
 }
-static bool readF32(uint8_t node, uint16_t index, float &out)
+static bool readF32(uint8_t node, uint16_t idx, float &out)
 {
   uint8_t le[4] = {0};
-  if (!RS.readParamRaw(node, index, le))
+  if (!RS.readParamRaw(node, idx, le))
     return false;
   memcpy(&out, le, 4);
   return true;
 }
-static bool writeU8(uint8_t node, uint16_t index, uint8_t v)
+static bool writeU8(uint8_t node, uint16_t idx, uint8_t v)
 {
   uint8_t le[4] = {v, 0, 0, 0};
-  return RS.writeParamLE(node, index, le);
+  return RS.writeParamLE(node, idx, le);
 }
 
-// ===== A: Status =====
-static void doStatus()
+// ===== Monitor（200ms周期で 0x7019/0x701B をType17読出し）=====
+static void drawMonitorFrame()
 {
   drawLayout();
-  uint16_t canMaster = 0xFFFF;
-  uint8_t run = 0xFF;
-  bool ok1 = readU16(MOTOR_ID, RS02Idx::CAN_MASTER, canMaster);
-  bool ok2 = readU8(MOTOR_ID, RS02Idx::RUN_MODE, run);
-  printLine(0, "CAN_MASTER(0x200B): %s 0x%04X", ok1 ? "OK" : "--", ok1 ? canMaster : 0);
-  printLine(1, "RUN_MODE (0x7005) : %s %u", ok2 ? "OK" : "--", ok2 ? run : 255);
+  printLine(0, "MONITOR — mechPos(0x7019)/mechVel(0x701B) polling");
+  spr.pushSprite(0, 0);
+}
+static void monitorTick()
+{
+  if (!monitorOn)
+    return;
+
+  uint8_t run = 255;
+  readU8(MOTOR_ID, RS02Idx::RUN_MODE, run);
+
+  float pos = 0.0f, vel = 0.0f, spdRef = 0.0f, locRef = 0.0f, iqRef = 0.0f;
+  bool okPos = readF32(MOTOR_ID, RS02Idx::MECH_POS, pos);
+  bool okVel = readF32(MOTOR_ID, RS02Idx::MECH_VEL, vel);
+  (void)readF32(MOTOR_ID, RS02Idx::SPD_REF, spdRef);
+  (void)readF32(MOTOR_ID, RS02Idx::LOC_REF, locRef);
+  (void)readF32(MOTOR_ID, RS02Idx::IQ_REF, iqRef);
+
+  if (okPos)
+    angleTrackUpdateFromMechPos(pos);
+
+  float limSpd = 0, limCur = 0, limCurOld = 0, limTq = 0, acc = 0;
+  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_SPD, limSpd);
+  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_CUR, limCur);
+  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_CUR_OLD, limCurOld);
+  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_TORQUE, limTq);
+  (void)readF32(MOTOR_ID, RS02Idx::ACC_RAD, acc);
+
+  printLine(1, "Mode=%u(%s)  Vel=%.3f%s rad/s",
+            run, modeName(curMode), vel, okVel ? "" : "?");
+
+  if (gAngle.has)
+  {
+    double turns = gAngle.accRad / (2.0 * M_PI);
+    double deg = gAngle.accRad * (180.0 / M_PI);
+    printLine(2, "Angle∞: pos=%.3f%s  ->  turns=%.1f  rad=%.3f  deg=%.1f",
+              pos, okPos ? "" : "?", turns, gAngle.accRad, deg);
+  }
+  else
+  {
+    printLine(2, "Angle∞: -- (waiting mechPos 0x7019)");
+  }
+
+  printLine(3, "Refs : loc=%.3f  spd=%.3f  iq=%.3f", locRef, spdRef, iqRef);
+  printLine(4, "Limit: I=%.1f IO=%.1f T=%.1f S=%.1f  acc=%.1f", limCur, limCurOld, limTq, limSpd, acc);
+
   spr.pushSprite(0, 0);
 }
 
-// ===== B: Bring-up + Demo =====
+// ===== Demo（B）=====
 static void doVelocityDemo()
 {
   drawLayout();
@@ -147,7 +200,7 @@ static void doVelocityDemo()
   ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR, LIMIT_CUR_A);
   ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR_OLD, LIMIT_CUR_A);
   ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::ACC_RAD, ACC_RAD_S2);
-  printLine(row++, "Params limit_cur(7018/2019)+acc(7022): %s", ok ? "OK" : "NG");
+  printLine(row++, "limit_cur(7018/2019)+acc(7022): %s", ok ? "OK" : "NG");
 
   bool okSpd = true;
   for (int i = 0; i < 10; i++)
@@ -156,15 +209,8 @@ static void doVelocityDemo()
     delay(20);
   }
   printLine(row++, "spd_ref(700A)=%.1f x10 : %s", SPD_REF, okSpd ? "OK" : "NG");
-
-  uint8_t rm = 0xFF;
-  float vel = 0;
-  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
-  readF32(MOTOR_ID, RS02Idx::MECH_VEL, vel);
-  printLine(row++, "Read-back RUN_MODE=%u  mechVel=%.2f", rm, vel);
   spr.pushSprite(0, 0);
 }
-
 static void doPPDemo()
 {
   drawLayout();
@@ -187,19 +233,14 @@ static void doPPDemo()
   delay(150);
   ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LOC_REF, 0.0f);
   printLine(row++, "loc_ref step: ->%.2f ->0.00 : %s", LOC_STEP, ok ? "OK" : "NG");
-
-  uint8_t rm = 0xFF;
-  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
-  printLine(row++, "Read-back RUN_MODE=%u", rm);
   spr.pushSprite(0, 0);
 }
-
 static void doCurrentDemo()
 {
   drawLayout();
   int row = 0;
-  const float LIMIT_TORQUE = 3.0f; // Nm（環境に応じて）
-  const float IQ_REF = 1.0f;       // A  （FWによりIndex差あり）
+  const float LIMIT_TORQUE = 3.0f; // Nm
+  const float IQ = 0.5f;           // A
 
   bool ok = RS.stop(MOTOR_ID, true);
   printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
@@ -211,41 +252,36 @@ static void doCurrentDemo()
   printLine(row++, "Enable             : %s", ok ? "OK" : "NG");
   delay(50);
   ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_TORQUE, LIMIT_TORQUE);
-  printLine(row++, "limit_torque(700B)=%.1f : %s", LIMIT_TORQUE, ok ? "OK" : "NG");
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::IQ_REF, IQ_REF);
-  printLine(row++, "iq_ref(700C)=%.2f : %s", IQ_REF, ok ? "OK" : "NG");
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::CUR_KP, 0.17f);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::CUR_KI, 0.012f);
+  printLine(row++, "limits/gains: tq=%.1f, cKp=0.17, cKi=0.012 -> %s", LIMIT_TORQUE, ok ? "OK" : "NG");
 
-  uint8_t rm = 0xFF;
-  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
-  printLine(row++, "Read-back RUN_MODE=%u", rm);
+  ok &= RS.currentIqRef(MOTOR_ID, +IQ);
+  delay(300);
+  ok &= RS.currentIqRef(MOTOR_ID, 0.0f);
+  delay(150);
+  ok &= RS.currentIqRef(MOTOR_ID, -IQ);
+  delay(300);
+  ok &= RS.currentIqRef(MOTOR_ID, 0.0f);
+  printLine(row++, "iq_ref sweep ±%.2f A : %s", IQ, ok ? "OK" : "NG");
   spr.pushSprite(0, 0);
 }
-
 static void doCSPDemo()
 {
   drawLayout();
   int row = 0;
-  const float LIMIT_SPD = 6.0f;      // rad/s
-  const float LIMIT_CUR = 5.0f;      // A
-  const float KP_LOC = 5.0f;         // 任意（必要な個体向け）
-  const float P1 = 1.57f, P2 = 0.0f; // 90deg -> 0
+  const float LIMIT_SPD = 6.0f; // rad/s
+  const float LIMIT_CUR = 5.0f; // A
+  const float KP_LOC = 5.0f;
+  const float P1 = 1.57f, P2 = 0.0f;
 
-  // ★ robust版：Enable前後でrun_mode=5を書き・前提パラメータを両系で適用
   bool ok = RS.enterCSP_robust(MOTOR_ID, LIMIT_SPD, LIMIT_CUR, KP_LOC);
   printLine(row++, "CSP robust (RM=5 twice + limits + KP): %s", ok ? "OK" : "NG");
-
-  // 読み戻し
-  uint8_t rm = 0xFF;
-  RS.readRunMode(MOTOR_ID, rm);
-  printLine(row++, "Read-back RUN_MODE=%u", rm);
-
-  // 位置指令
   bool okRef = true;
   okRef &= RS.cspLocRef(MOTOR_ID, P1);
   delay(180);
   okRef &= RS.cspLocRef(MOTOR_ID, P2);
   printLine(row++, "loc_ref(7016): 1.57 -> 0.00 : %s", okRef ? "OK" : "NG");
-
   spr.pushSprite(0, 0);
 }
 
@@ -273,12 +309,16 @@ void setup()
     while (1)
       delay(1000);
   }
-  CAN.setMode(MCP_NORMAL); // 念のためNORMAL
+  CAN.setMode(MCP_NORMAL);
   RS.begin();
-  RS.setMasterId(0xFD); // ★ 参考実機に合う既定
+  RS.setMasterId(0xFD);
+
+  // 任意：Type2を有効化（出ない個体もあるが無害）
+  RS.setActiveReport(MOTOR_ID, true);
+  RS.setReportIntervalTicks(MOTOR_ID, 1);
 
   drawLayout();
-  printLine(0, "READY. Mode=%s  (A:Status / B:Demo / C:Next)", modeName(curMode));
+  printLine(0, "READY. Mode=%s  (A:Monitor / B:Demo / C:Next)", modeName(curMode));
   spr.pushSprite(0, 0);
 }
 
@@ -288,7 +328,10 @@ void loop()
 
   if (M5.BtnA.wasPressed())
   {
-    doStatus();
+    monitorOn = !monitorOn;
+    drawMonitorFrame();
+    if (monitorOn)
+      nextMonUpdate = 0;
   }
   if (M5.BtnB.wasPressed())
   {
@@ -316,5 +359,12 @@ void loop()
     spr.pushSprite(0, 0);
   }
 
-  delay(5);
+  // Monitor: 200ms周期で Type17 読み
+  if (monitorOn && (int32_t)(millis() - nextMonUpdate) >= 0)
+  {
+    monitorTick();
+    nextMonUpdate = millis() + 200;
+  }
+
+  delay(3);
 }

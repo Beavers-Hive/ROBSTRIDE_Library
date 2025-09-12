@@ -1,4 +1,4 @@
-// RS02PrivateCAN.cpp — FD00/LE/応答dst拡張・4引数readMsgBuf 対応
+// RS02PrivateCAN.cpp — Type17応答dstを緩和（targetIdもOK）/ mechPos=0x7019, mechVel=0x701B
 #include "RS02PrivateCAN.h"
 #include <math.h>
 
@@ -48,6 +48,32 @@ bool RS02PrivateCAN::stop(uint8_t targetId, bool clearFault)
   return sendExt(id, d, 8);
 }
 
+bool RS02PrivateCAN::setMotorId(uint8_t currentId, uint8_t newId)
+{
+  // Type7: mode=0x07, DataArea2 = [newId:high][hostId:low], dst=currentId
+  byte d[8] = {0};
+  auto id = buildExId(0x07, ((uint16_t)newId << 8) | _hostId, currentId);
+  return sendExt(id, d, 8);
+}
+
+bool RS02PrivateCAN::saveParams(uint8_t targetId)
+{
+  // Type22: 保存。データ内容は仕様上ダミーでOK（01..08を送る例）
+  byte d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  auto id = buildExId(0x16, ((uint16_t)_hostId << 8) | targetId, targetId);
+  return sendExt(id, d, 8);
+}
+
+bool RS02PrivateCAN::setMotorIdViaParam(uint8_t targetId, uint8_t newId, bool save)
+{
+  // 0x200A = CAN_ID (uint8)
+  byte v[4] = {newId, 0, 0, 0};
+  bool ok = writeParamLE(targetId, 0x200A, v); // Type18
+  if (ok && save)
+    ok &= saveParams(targetId); // Type22（必要に応じて）
+  return ok;
+}
+
 // ===== Param Write/Read (index=LE) =====
 bool RS02PrivateCAN::writeParamLE(uint8_t targetId, uint16_t index, const uint8_t valueLE[4])
 {
@@ -69,6 +95,7 @@ bool RS02PrivateCAN::writeFloatParam(uint8_t targetId, uint16_t index, float val
 }
 bool RS02PrivateCAN::readParamRaw(uint8_t targetId, uint16_t index, uint8_t out4LE[4])
 {
+  // 要求送信
   uint8_t d[8] = {0};
   d[0] = (uint8_t)(index & 0xFF);
   d[1] = (uint8_t)(index >> 8);
@@ -76,9 +103,10 @@ bool RS02PrivateCAN::readParamRaw(uint8_t targetId, uint16_t index, uint8_t out4
   if (!sendExt(rid, d, 8))
     return false;
 
+  // 応答待ち
   RS02PrivFrame f;
   uint32_t t0 = millis();
-  while (millis() - t0 < 500)
+  while ((millis() - t0) < 300)
   {
     if (!readAny(f))
     {
@@ -89,12 +117,12 @@ bool RS02PrivateCAN::readParamRaw(uint8_t targetId, uint16_t index, uint8_t out4
     if (type != 0x11)
       continue;
 
+    // ★ 応答dstが targetId（モータID）で来る個体も許可
     uint8_t dst = (uint8_t)(f.id & 0xFF);
-    if (dst == targetId)
-      continue; // 自分エコー除外
-    if (!(dst == _hostId || dst == 0x00 || dst == 0xFF || dst == 0xFE))
+    if (!(dst == _hostId || dst == 0x00 || dst == 0xFF || dst == 0xFE || dst == targetId))
       continue;
 
+    // indexエコー（LE/BEどちらでも一致でOK）
     uint16_t idxLE = (uint16_t)f.data[0] | ((uint16_t)f.data[1] << 8);
     uint16_t idxBE = (uint16_t)f.data[1] | ((uint16_t)f.data[0] << 8);
     if (idxLE != index && idxBE != index)
@@ -265,21 +293,20 @@ bool RS02PrivateCAN::bringUpPPPerSpec(uint8_t targetId, float limitSpdRadS, floa
 }
 
 // ===== Current =====
-bool RS02PrivateCAN::enterCurrent(uint8_t id, float limitTorqueNm, float curKp, float curKi)
+bool RS02PrivateCAN::enterCurrent(uint8_t targetId, float limitTorqueNm, float curKp, float curKi)
 {
   uint8_t rm[4] = {3, 0, 0, 0};
-  bool ok = writeParamLE(id, RS02Idx::RUN_MODE, rm);
-  ok &= writeFloatParam(id, RS02Idx::LIMIT_TORQUE, limitTorqueNm);
+  bool ok = writeParamLE(targetId, RS02Idx::RUN_MODE, rm);
+  ok &= writeFloatParam(targetId, RS02Idx::LIMIT_TORQUE, limitTorqueNm);
   if (!isnan(curKp))
-    ok &= writeFloatParam(id, RS02Idx::CUR_KP, curKp); // ← KPは7010
+    ok &= writeFloatParam(targetId, RS02Idx::CUR_KP, curKp);
   if (!isnan(curKi))
-    ok &= writeFloatParam(id, RS02Idx::CUR_KI, curKi); // ← KIは7011
+    ok &= writeFloatParam(targetId, RS02Idx::CUR_KI, curKi);
   return ok;
 }
-
-bool RS02PrivateCAN::currentIqRef(uint8_t id, float iqA)
+bool RS02PrivateCAN::currentIqRef(uint8_t targetId, float iqA)
 {
-  return writeFloatParam(id, RS02Idx::IQ_REF, iqA); // ← 0x7006 を使用
+  return writeFloatParam(targetId, RS02Idx::IQ_REF, iqA); // 0x7006
 }
 bool RS02PrivateCAN::bringUpCurrentPerSpec(uint8_t targetId, float iqA)
 {
@@ -330,45 +357,29 @@ bool RS02PrivateCAN::enterCSP_simple(uint8_t targetId, float limitSpdRadS)
   delay(5);
   return enable(targetId);
 }
-
-// ★ Enable前後で2回run_mode=5を書き、limit_spd/limit_cur(新旧)/loc_kpを適用してフォールバック(3)を回避
 bool RS02PrivateCAN::enterCSP_robust(uint8_t targetId, float limitSpdRadS, float limitCurA, float locKp)
 {
   bool ok = stop(targetId, true);
   delay(100);
-
   uint8_t rm5[4] = {5, 0, 0, 0};
-  // 事前にRUN_MODE=5を書いておく
   ok &= writeParamLE(targetId, RS02Idx::RUN_MODE, rm5);
   delay(30);
-
-  // 前提パラメータ（新旧系ともに）
   ok &= writeFloatParam(targetId, RS02Idx::LIMIT_SPD, limitSpdRadS);
   ok &= writeFloatParam(targetId, RS02Idx::LIMIT_CUR, limitCurA);
   ok &= writeFloatParam(targetId, RS02Idx::LIMIT_CUR_OLD, limitCurA);
   if (!isnan(locKp))
     ok &= writeFloatParam(targetId, RS02Idx::LOC_KP, locKp);
-
-  // Enable
   ok &= enable(targetId);
   delay(50);
-
-  // Enable後にもう一度 RUN_MODE=5 を書く（フォールバック対策）
   ok &= writeParamLE(targetId, RS02Idx::RUN_MODE, rm5);
   delay(30);
-
-  // 読み戻し確認
   uint8_t cur = 0xFF;
-  if (readRunMode(targetId, cur))
-  {
-    // 5でなく3に戻るなら false を返して呼び出し側で扱う
-    if (cur != 5)
-      return false;
-  }
+  if (readRunMode(targetId, cur) && cur != 5)
+    return false;
   return ok;
 }
 
-// ===== 無限回転 =====
+// ===== 無限回転（パラメータ合成; 使えないFWあり）=====
 bool RS02PrivateCAN::getInfiniteByParams(uint8_t targetId, double &turns, double &angleRad)
 {
   float rotA = 0.0f, rotB = 0.0f, mod = 0.0f;
