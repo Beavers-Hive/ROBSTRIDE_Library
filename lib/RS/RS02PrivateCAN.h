@@ -1,158 +1,165 @@
 #pragma once
+// RS02PrivateCAN.h — FD00/LE/応答dst拡張（host,0x00,0xFF,0xFE）
+// 依存: Arduino, mcp_can (Cory Fowler系 / 4引数 readMsgBuf)
+
 #include <Arduino.h>
 #include <mcp_can.h>
+#include <stdint.h>
+
+namespace RS02Idx
+{
+    // ランモード/制御
+    static constexpr uint16_t RUN_MODE = 0x7005; // u8: 0=Operation,1=PP,2=Velocity,3=Current,5=CSP
+    // Velocity
+    static constexpr uint16_t SPD_REF = 0x700A;      // f32: rad/s
+    static constexpr uint16_t LIMIT_TORQUE = 0x700B; // f32: Nm
+    static constexpr uint16_t IQ_REF = 0x7006;       // ← 0x700C から修正（q軸電流[A]）
+    static constexpr uint16_t CUR_KP = 0x7010;       // 追加: CurrentループKP
+    static constexpr uint16_t CUR_KI = 0x7011;       // 追加: CurrentループKI
+    // PP/CSP 共通
+    static constexpr uint16_t LOC_REF = 0x7016;   // f32: rad
+    static constexpr uint16_t LIMIT_SPD = 0x7017; // f32: rad/s
+    static constexpr uint16_t LIMIT_CUR = 0x7018; // f32: A（新系）
+    static constexpr uint16_t MECH_VEL = 0x701B;  // f32: rad/s
+    static constexpr uint16_t SPD_KP = 0x701C;    // f32
+    static constexpr uint16_t SPD_KI = 0x701D;    // f32
+    static constexpr uint16_t LOC_KP = 0x701E;    // f32
+    static constexpr uint16_t ACC_RAD = 0x7022;   // f32: rad/s^2
+    // 旧系（個体差対策）
+    static constexpr uint16_t LIMIT_CUR_OLD = 0x2019; // f32: A
+    // 診断
+    static constexpr uint16_t CAN_MASTER = 0x200B;  // u16
+    static constexpr uint16_t SPD_REF_MIR = 0x302F; // f32（存在しない個体あり）
+    // 無限回転関連
+    static constexpr uint16_t IDX_ROTATION = 0x3014;       // f32
+    static constexpr uint16_t IDX_MODPOS = 0x3015;         // f32
+    static constexpr uint16_t IDX_MECH_ANGLE_ROT = 0x3036; // f32
+    // レポート（必要に応じて調整）
+    static constexpr uint16_t IDX_EPSCAN_TIME = 0x5001; // u16 (仮)
+}
 
 struct RS02PrivFrame
 {
-    unsigned long id = 0; // 29bit拡張ID
-    byte dlc = 0;
-    byte data[8] = {0};
-    bool isExt = true;
+    unsigned long id = 0; // mcp_canに合わせる
+    uint8_t dlc = 0;
+    uint8_t data[8] = {0};
+    bool isExt = false;
 };
 
-// ===== パラメータインデックスの定数（PDF準拠） =====
-struct RS02Idx
+struct RS02Feedback
 {
-    static constexpr uint16_t RUN_MODE = 0x7005;     // 0:Operation,1:PP,2:Velocity,3:Current,5:CSP
-    static constexpr uint16_t IQ_REF = 0x7006;       // Current mode Iq command [A]
-    static constexpr uint16_t SPD_REF = 0x700A;      // Velocity mode speed ref [rad/s]
-    static constexpr uint16_t LIMIT_TORQUE = 0x700B; // Torque limit [Nm]
-    static constexpr uint16_t LOC_REF = 0x7016;      // CSP position ref [rad]
-    static constexpr uint16_t LIMIT_SPD = 0x7017;    // CSP speed limit [rad/s]
-    static constexpr uint16_t LIMIT_CUR = 0x7018;    // Position/Velocity current limit [A]
-    static constexpr uint16_t CUR_KP = 0x7010;       // Current loop Kp
-    static constexpr uint16_t CUR_KI = 0x7011;       // Current loop Ki
-    static constexpr uint16_t LOC_KP = 0x701E;       // Position loop Kp
-    static constexpr uint16_t SPD_KP = 0x701F;       // Speed loop Kp
-    static constexpr uint16_t SPD_KI = 0x7020;       // Speed loop Ki
-    static constexpr uint16_t ACC_RAD = 0x7022;      // Velocity mode acceleration [rad/s^2]
+    uint8_t motorId = 0;
+    uint16_t faultBits = 0;
+    uint8_t mode = 0;
+    float angleRad = 0.0f;
+    float velRadS = 0.0f;
+    float torqueNm = 0.0f;
+    float tempC = 0.0f;
 };
 
 class RS02PrivateCAN
 {
 public:
-    explicit RS02PrivateCAN(MCP_CAN &can, uint8_t hostId = 0xFD)
+    RS02PrivateCAN(MCP_CAN &can, uint8_t hostId)
         : _can(can), _hostId(hostId) {}
 
     bool begin();
+    void setMasterId(uint8_t mid) { _masterId = mid; } // 既定=0xFD
+    uint8_t masterId() const { return _masterId; }
+    uint8_t hostId() const { return _hostId; }
 
-    // 29bitID: Bit[28:24]=通信タイプ, Bit[23:8]=DataArea2(用途可変), Bit[7:0]=Destination(motor id)
-    static inline unsigned long buildExId(uint8_t type, uint16_t data16, uint8_t targetId)
-    {
-        return ((unsigned long)(type & 0x1F) << 24) | ((unsigned long)data16 << 8) | (unsigned long)targetId;
-    }
-
-    bool sendExt(unsigned long id, const byte *payload, byte len);
-
+    // 低レベル
+    bool sendExt(unsigned long id, const uint8_t *payload, uint8_t len);
     bool readAny(RS02PrivFrame &out);
 
-    // 便利ヘルパ
-    static inline void packF32LE(float v, byte *d)
-    {
-        uint32_t u;
-        memcpy(&u, &v, 4);
-        d[0] = u & 0xFF;
-        d[1] = (u >> 8) & 0xFF;
-        d[2] = (u >> 16) & 0xFF;
-        d[3] = (u >> 24) & 0xFF;
-    }
-    static inline uint16_t float_to_uint(float x, float x_min, float x_max)
-    {
-        float span = x_max - x_min;
-        if (x > x_max)
-            x = x_max;
-        else if (x < x_min)
-            x = x_min;
-        return (uint16_t)((x - x_min) * 65535.0f / span + 0.5f);
-    }
-    static inline float uint_to_float(uint16_t u, float x_min, float x_max)
-    {
-        float span = x_max - x_min;
-        return (float)u * span / 65535.0f + x_min;
-    }
-    static inline void packU16BE(uint16_t v, byte *d)
-    {
-        d[0] = (byte)(v >> 8);
-        d[1] = (byte)(v & 0xFF);
-    }
-    static inline uint16_t unpackU16BE(const byte *d) { return (uint16_t)((d[0] << 8) | d[1]); }
+    // 基本コマンド
+    bool ping(uint8_t targetId);                  // Type0
+    bool enable(uint8_t targetId);                // Type3
+    bool stop(uint8_t targetId, bool clearFault); // Type4
 
-    // ====== Privateプロトコルの主な操作 ======
-
-    // 通信タイプ0: Get device ID（Ping）
-    bool ping(uint8_t targetId);
-
-    // 通信タイプ3: Enable
-    bool enable(uint8_t targetId);
-
-    // 通信タイプ4: Stop / Fault Clear（Byte0..1=1でクリア）
-    bool stop(uint8_t targetId, bool clearFault = false);
-
-    // 通信タイプ18(0x12): Write single parameter（index(2B BE), value(4B LE)）
-    bool writeParamLE(uint8_t targetId, uint16_t index, const byte valueLE[4]);
+    // パラメータR/W（index=LE）
+    bool writeParamLE(uint8_t targetId, uint16_t index, const uint8_t valueLE[4]);
     bool writeFloatParam(uint8_t targetId, uint16_t index, float value);
+    bool readParamRaw(uint8_t targetId, uint16_t index, uint8_t out4LE[4]);
+    bool readFloatParam(uint8_t targetId, uint16_t index, float &out);
 
-    // 通信タイプ25(0x19): Protocol switch（0:Private,1:CANopen,2:MIT）※参考
-    bool switchProtocol(uint8_t targetId, uint8_t fcmd);
+    // プロトコル/レポート
+    bool switchProtocol(uint8_t targetId, uint8_t fcmd); // Type25
+    bool setActiveReport(uint8_t targetId, bool enable); // Type24
+    bool setReportIntervalTicks(uint8_t targetId, uint16_t ticks);
 
-    // 通信タイプ1: Operation Control（pos/vel/Kp/Kd は data部 16bitBE、torque はID側DataArea2）
+    // Operation Control（Type1のみDA2=トルク）
     bool opControl(uint8_t targetId, float torqueNm, float posRad, float velRadS, float kp, float kd);
 
-    // フィードバック（通信タイプ2）の簡易デコード
-    struct Feedback
-    {
-        uint8_t motorId = 0;
-        uint16_t faultBits = 0;
-        uint8_t mode = 0;
-        float angleRad = 0, velRadS = 0, torqueNm = 0, tempC = 0;
-    };
-    bool parseFeedback(const RS02PrivFrame &f, Feedback &out);
+    // 受信解析 Type2
+    bool parseFeedback(const RS02PrivFrame &f, RS02Feedback &out);
 
-    // 走行モード（0=Operation,1=PP,2:Velocity,3:Current,5:CSP）: パラメータ 0x7005
+    // ランモード
     bool setRunMode(uint8_t targetId, uint8_t runMode);
+    bool readRunMode(uint8_t targetId, uint8_t &outMode); // 追加：RUN_MODE読取
 
-    // ===== Velocity / Current / CSP 用ユーティリティ =====
-
-    // --- Velocity mode ---
-    // 推奨フロー: stop(clear) → enable() → enterVelocity() → velocityRef() を周期送信(50〜100ms)
-    bool enterVelocity(uint8_t targetId,
-                       float limitCurA = 10.0f, // 0..23 A
-                       float accRadS2 = 20.0f,  // 既定 20 rad/s^2
-                       float spdKp = NAN,       // 任意: 既定 6
-                       float spdKi = NAN);      // 任意: 既定 0.02
-
-    // 速度指令（rad/s）※50〜100ms 間隔で連続送信推奨
+    // ===== Velocity =====
+    bool enterVelocity(uint8_t targetId, float limitCurA, float accRadS2, float spdKp = NAN, float spdKi = NAN);
     bool velocityRef(uint8_t targetId, float spdRadS);
+    bool enterVelocityStrict(uint8_t targetId, float limitTorqueNm, float limitCurA, float accRadS2, float spdKp = NAN, float spdKi = NAN);
+    bool bringUpVelocityPerSpec(uint8_t targetId, float limitCurA, float accRadS2, float spdRadS);
 
-    // Velocityモードの"決め打ちBring-up"手順（PDF順序に厳密）
-    bool enterVelocityStrict(uint8_t targetId,
-                             float limitTorqueNm, // 例: 6〜10
-                             float limitCurA,     // 例: 8〜12
-                             float accRadS2,      // 例: 10〜30
-                             float spdKp = NAN,   // 任意
-                             float spdKi = NAN);  // 任意
+    // ===== PP (Profile Position) =====
+    bool enterPP(uint8_t targetId, float limitSpdRadS, float locKp = NAN);
+    bool ppLocRef(uint8_t targetId, float posRad);
+    bool bringUpPPPerSpec(uint8_t targetId, float limitSpdRadS, float posRad);
 
-    // --- Current mode ---
-    // 推奨フロー: stop(clear) → enable() → enterCurrent() → currentIqRef() を周期送信(20〜50ms)
-    bool enterCurrent(uint8_t targetId,
-                      float limitTorqueNm = 10.0f, // 0..17 Nm
-                      float curKp = NAN,           // 任意: 既定 0.17
-                      float curKi = NAN);          // 任意: 既定 0.012
-
-    // 電流指令（Iq [A]）。モータ仕様の定格内で。
+    // ===== Current =====
+    bool enterCurrent(uint8_t targetId, float limitTorqueNm, float curKp = NAN, float curKi = NAN);
     bool currentIqRef(uint8_t targetId, float iqA);
+    bool bringUpCurrentPerSpec(uint8_t targetId, float iqA);
 
-    // --- CSP (Cyclic Synchronous Position) ---
-    // 推奨フロー: stop(clear) → enable() → enterCSP() → cspLocRef() を必要に応じて送信
-    bool enterCSP(uint8_t targetId,
-                  float limitSpdRadS = 10.0f, // 0..44 rad/s
-                  float limitCurA = 10.0f,    // 0..23 A
-                  float locKp = NAN);         // 任意: 既定 40
-
-    // 位置指令（rad）。必要なら一定周期で再発行（例: 50〜100ms）
+    // ===== CSP =====
+    bool enterCSP(uint8_t targetId, float limitSpdRadS, float limitCurA, float locKp = NAN);
     bool cspLocRef(uint8_t targetId, float posRad);
+    bool bringUpCSPPerSpec(uint8_t targetId, float limitSpdRadS, float posRad);
+    bool enterCSP_simple(uint8_t targetId, float limitSpdRadS);
+    // ★ 追加：Enable前後で2回run_mode=5を書き、前提パラメータも併せて適用する堅牢版
+    bool enterCSP_robust(uint8_t targetId, float limitSpdRadS, float limitCurA, float locKp = NAN);
+
+    // 無限回転合成
+    bool getInfiniteByParams(uint8_t targetId, double &turns, double &angleRad);
 
 private:
     MCP_CAN &_can;
-    uint8_t _hostId;
+    uint8_t _hostId = 0x00;
+    uint8_t _masterId = 0xFD; // 実機報告に合わせた既定
+
+    inline uint16_t da2_master() const { return ((uint16_t)_masterId << 8) | 0x00; }
+    static inline uint32_t buildExId(uint8_t type5, uint16_t da2, uint8_t dst)
+    {
+        return ((uint32_t)(type5 & 0x1F) << 24) | ((uint32_t)da2 << 8) | (uint32_t)dst;
+    }
+
+    // パック/演算
+    static inline void packU16BE(uint16_t v, uint8_t *p)
+    {
+        p[0] = (uint8_t)(v >> 8);
+        p[1] = (uint8_t)(v);
+    }
+    static inline uint16_t unpackU16BE(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+    static inline void packF32LE(float f, uint8_t *p)
+    {
+        uint32_t u;
+        memcpy(&u, &f, 4);
+        p[0] = u;
+        p[1] = u >> 8;
+        p[2] = u >> 16;
+        p[3] = u >> 24;
+    }
+
+    static inline uint16_t float_to_uint(float x, float x_min, float x_max)
+    {
+        float cl = (x < x_min) ? x_min : (x > x_max ? x_max : x);
+        return (uint16_t)((cl - x_min) * 65535.0f / (x_max - x_min));
+    }
+    static inline float uint_to_float(uint16_t x, float x_min, float x_max)
+    {
+        return ((float)x) * (x_max - x_min) / 65535.0f + x_min;
+    }
 };

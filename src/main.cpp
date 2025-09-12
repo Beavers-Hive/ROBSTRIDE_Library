@@ -1,279 +1,319 @@
+// main.cpp — Velocity / PP / Current / CSP（robust）検証UI
+// M5Unified + MCP2515(1Mbps) / mcp_can 4引数 readMsgBuf 版
+//
+// 操作：
+//  左(A)  … ステータス取得（CAN_MASTER / RUN_MODE）
+//  中(B)  … 選択モードの Bring-up & デモ指令
+//  右(C)  … Modeを Velocity→PP→Current→CSP→… とローテーション
+//
+// 表示は毎回スプライト全描画（重なり/見切れなし）
+
+#include <M5Unified.h>
 #include <SPI.h>
 #include <mcp_can.h>
-#include <M5Unified.h>
+#include <stdarg.h>
 #include "RS02PrivateCAN.h"
 
-// ====== ハード設定 ======
+// ===== CAN配線/設定 =====
 #define CAN_CS_PIN 6
-// MCP2515 の水晶に合わせて切り替え（多くは 16MHz です）
-#define MCP_CLOCK MCP_8MHZ // 16MHz の場合は MCP_16MHZ
 #define CAN_BAUD CAN_1000KBPS
+#define MCP_CLOCK MCP_8MHZ // 16MHz基板なら MCP_16MHZ
+
+// ===== ノード設定 =====
+constexpr uint8_t HOST_ID = 0x00;
+constexpr uint8_t MOTOR_ID = 0x7F;
 
 MCP_CAN CAN(CAN_CS_PIN);
-RS02PrivateCAN RS(CAN, /*hostId*/ 0xFD);
+RS02PrivateCAN RS(CAN, HOST_ID);
 
-// ====== 動作用の設定 ======
-constexpr uint8_t MOTOR_ID = 0x7F; // まずは1から試す
-bool activeReportOn = false;
+// ===== UI =====
+M5Canvas spr(&M5.Display);
+const int W = 320, H = 240, PAD = 6;
 
-// ====== 操作用の状態 ======
-uint8_t modeState = 0; // 0:pos, 1:velocity, 2:current, 3:CSP
-uint8_t posState = 0;  // 0:90度, 1:0度, 2:-90度
-uint32_t lastOpMs = 0;
-const char *modeNames[] = {"Position", "Velocity", "Current", "CSP"};
-
-// ====== 画面ログユーティリティ ======
-int lineHeight = 14;
-
-void drawHeader(const char *status, uint16_t color = CYAN)
+enum class Mode : uint8_t
 {
-  auto &D = M5.Display;
-  D.fillRect(0, 0, D.width(), 28, BLACK);
-  D.setTextColor(color, BLACK);
-  D.setCursor(0, 0);
-  D.printf("RS02 Private Debug  |  Mode: %s  |  %s\n", modeNames[modeState], status);
-  D.setTextColor(WHITE, BLACK);
-  D.drawLine(0, 28, D.width(), 28, 0x7BEF);
-  D.setCursor(0, 30);
-}
-void logLine(const String &s, uint16_t color = WHITE)
+  Velocity = 0,
+  PP = 1,
+  Current = 2,
+  CSP = 3
+};
+Mode curMode = Mode::Velocity;
+
+static const char *modeName(Mode m)
 {
-  Serial.println(s);
-  auto &D = M5.Display;
-  int y = D.getCursorY();
-  if (y > D.height() - lineHeight)
+  switch (m)
   {
-    D.fillRect(0, 30, D.width(), D.height() - 30, BLACK); // 下部ログエリアだけ消す
-    D.setCursor(0, 30);
+  case Mode::Velocity:
+    return "Velocity";
+  case Mode::PP:
+    return "PP";
+  case Mode::Current:
+    return "Current";
+  case Mode::CSP:
+    return "CSP";
   }
-  D.setTextColor(color, BLACK);
-  D.println(s);
+  return "?";
 }
 
-// ====== 受信フレームの表示 ======
-void showRawFrame(const RS02PrivFrame &f)
+static void drawLayout()
 {
-  String s = String(f.isExt ? "[EXT]" : "[STD]") + " ID=0x" + String(f.id, HEX) + " DLC=" + String(f.dlc) + " Data:";
-  for (int i = 0; i < f.dlc; i++)
-    s += " " + String(f.data[i], HEX);
-  logLine(s, 0xCFFF);
+  spr.fillScreen(BLACK);
+  spr.setTextSize(1);
+  spr.setTextColor(WHITE, BLACK);
+  spr.setCursor(PAD, PAD);
+  spr.printf("RS02 Multi-Mode Tester  HOST=0x%02X  MOTOR=0x%02X  MASTER=0x%02X\n",
+             HOST_ID, MOTOR_ID, RS.masterId());
+  spr.setCursor(PAD, PAD + 16);
+  spr.printf("[A] Status  [B] Bring-up+Demo  [C] Mode=%s\n", modeName(curMode));
+  spr.drawRect(2, 40, W - 4, 192, 0x7BEF);
 }
 
-// ====== 初期化 ======
+static void printLine(int row, const char *fmt, ...)
+{
+  char buf[230];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  int y = 46 + row * 18;
+  spr.fillRect(6, y - 2, W - 12, 18, BLACK);
+  spr.setCursor(6, y);
+  spr.setTextColor(WHITE, BLACK);
+  spr.print(buf);
+}
+
+// ===== 小ヘルパ =====
+static bool readU16(uint8_t node, uint16_t index, uint16_t &out)
+{
+  uint8_t le[4] = {0};
+  if (!RS.readParamRaw(node, index, le))
+    return false;
+  out = (uint16_t)le[0] | ((uint16_t)le[1] << 8);
+  return true;
+}
+static bool readU8(uint8_t node, uint16_t index, uint8_t &out)
+{
+  uint8_t le[4] = {0};
+  if (!RS.readParamRaw(node, index, le))
+    return false;
+  out = le[0];
+  return true;
+}
+static bool readF32(uint8_t node, uint16_t index, float &out)
+{
+  uint8_t le[4] = {0};
+  if (!RS.readParamRaw(node, index, le))
+    return false;
+  memcpy(&out, le, 4);
+  return true;
+}
+static bool writeU8(uint8_t node, uint16_t index, uint8_t v)
+{
+  uint8_t le[4] = {v, 0, 0, 0};
+  return RS.writeParamLE(node, index, le);
+}
+
+// ===== A: Status =====
+static void doStatus()
+{
+  drawLayout();
+  uint16_t canMaster = 0xFFFF;
+  uint8_t run = 0xFF;
+  bool ok1 = readU16(MOTOR_ID, RS02Idx::CAN_MASTER, canMaster);
+  bool ok2 = readU8(MOTOR_ID, RS02Idx::RUN_MODE, run);
+  printLine(0, "CAN_MASTER(0x200B): %s 0x%04X", ok1 ? "OK" : "--", ok1 ? canMaster : 0);
+  printLine(1, "RUN_MODE (0x7005) : %s %u", ok2 ? "OK" : "--", ok2 ? run : 255);
+  spr.pushSprite(0, 0);
+}
+
+// ===== B: Bring-up + Demo =====
+static void doVelocityDemo()
+{
+  drawLayout();
+  int row = 0;
+  const float LIMIT_CUR_A = 5.0f;
+  const float ACC_RAD_S2 = 20.0f;
+  const float SPD_REF = 2.0f;
+
+  bool ok = RS.stop(MOTOR_ID, true);
+  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
+  delay(100);
+  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 2);
+  printLine(row++, "RUN_MODE=2: %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.enable(MOTOR_ID);
+  printLine(row++, "Enable    : %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR, LIMIT_CUR_A);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR_OLD, LIMIT_CUR_A);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::ACC_RAD, ACC_RAD_S2);
+  printLine(row++, "Params limit_cur(7018/2019)+acc(7022): %s", ok ? "OK" : "NG");
+
+  bool okSpd = true;
+  for (int i = 0; i < 10; i++)
+  {
+    okSpd &= RS.writeFloatParam(MOTOR_ID, RS02Idx::SPD_REF, SPD_REF);
+    delay(20);
+  }
+  printLine(row++, "spd_ref(700A)=%.1f x10 : %s", SPD_REF, okSpd ? "OK" : "NG");
+
+  uint8_t rm = 0xFF;
+  float vel = 0;
+  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
+  readF32(MOTOR_ID, RS02Idx::MECH_VEL, vel);
+  printLine(row++, "Read-back RUN_MODE=%u  mechVel=%.2f", rm, vel);
+  spr.pushSprite(0, 0);
+}
+
+static void doPPDemo()
+{
+  drawLayout();
+  int row = 0;
+  const float LIMIT_SPD = 3.0f; // rad/s
+  const float LOC_STEP = 1.57f; // 90deg
+
+  bool ok = RS.stop(MOTOR_ID, true);
+  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
+  delay(100);
+  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 1);
+  printLine(row++, "RUN_MODE=1(PP): %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.enable(MOTOR_ID);
+  printLine(row++, "Enable         : %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_SPD, LIMIT_SPD);
+  printLine(row++, "limit_spd(7017)=%.1f : %s", LIMIT_SPD, ok ? "OK" : "NG");
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LOC_REF, LOC_STEP);
+  delay(150);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LOC_REF, 0.0f);
+  printLine(row++, "loc_ref step: ->%.2f ->0.00 : %s", LOC_STEP, ok ? "OK" : "NG");
+
+  uint8_t rm = 0xFF;
+  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
+  printLine(row++, "Read-back RUN_MODE=%u", rm);
+  spr.pushSprite(0, 0);
+}
+
+static void doCurrentDemo()
+{
+  drawLayout();
+  int row = 0;
+  const float LIMIT_TORQUE = 3.0f; // Nm（環境に応じて）
+  const float IQ_REF = 1.0f;       // A  （FWによりIndex差あり）
+
+  bool ok = RS.stop(MOTOR_ID, true);
+  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
+  delay(100);
+  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 3);
+  printLine(row++, "RUN_MODE=3(Current): %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.enable(MOTOR_ID);
+  printLine(row++, "Enable             : %s", ok ? "OK" : "NG");
+  delay(50);
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_TORQUE, LIMIT_TORQUE);
+  printLine(row++, "limit_torque(700B)=%.1f : %s", LIMIT_TORQUE, ok ? "OK" : "NG");
+  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::IQ_REF, IQ_REF);
+  printLine(row++, "iq_ref(700C)=%.2f : %s", IQ_REF, ok ? "OK" : "NG");
+
+  uint8_t rm = 0xFF;
+  readU8(MOTOR_ID, RS02Idx::RUN_MODE, rm);
+  printLine(row++, "Read-back RUN_MODE=%u", rm);
+  spr.pushSprite(0, 0);
+}
+
+static void doCSPDemo()
+{
+  drawLayout();
+  int row = 0;
+  const float LIMIT_SPD = 6.0f;      // rad/s
+  const float LIMIT_CUR = 5.0f;      // A
+  const float KP_LOC = 5.0f;         // 任意（必要な個体向け）
+  const float P1 = 1.57f, P2 = 0.0f; // 90deg -> 0
+
+  // ★ robust版：Enable前後でrun_mode=5を書き・前提パラメータを両系で適用
+  bool ok = RS.enterCSP_robust(MOTOR_ID, LIMIT_SPD, LIMIT_CUR, KP_LOC);
+  printLine(row++, "CSP robust (RM=5 twice + limits + KP): %s", ok ? "OK" : "NG");
+
+  // 読み戻し
+  uint8_t rm = 0xFF;
+  RS.readRunMode(MOTOR_ID, rm);
+  printLine(row++, "Read-back RUN_MODE=%u", rm);
+
+  // 位置指令
+  bool okRef = true;
+  okRef &= RS.cspLocRef(MOTOR_ID, P1);
+  delay(180);
+  okRef &= RS.cspLocRef(MOTOR_ID, P2);
+  printLine(row++, "loc_ref(7016): 1.57 -> 0.00 : %s", okRef ? "OK" : "NG");
+
+  spr.pushSprite(0, 0);
+}
+
+// ===== Arduino lifecycle =====
 void setup()
 {
   auto cfg = M5.config();
   M5.begin(cfg);
-  M5.Display.setTextSize(1);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.fillScreen(BLACK);
-  drawHeader("Booting...");
+  M5.Display.setTextWrap(false, false);
 
-  Serial.begin(115200);
-  while (!Serial)
+  spr.setColorDepth(8);
+  spr.createSprite(W, H);
+  spr.setTextWrap(false, false);
+  spr.setTextSize(1);
+
+  SPI.begin();
+
+  if (CAN.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) != CAN_OK)
   {
+    spr.fillScreen(BLACK);
+    spr.setCursor(PAD, PAD);
+    spr.setTextColor(RED, BLACK);
+    spr.println("CAN.begin FAIL");
+    spr.pushSprite(0, 0);
+    while (1)
+      delay(1000);
   }
-
-  // MCP2515 初期化
-  while (CAN.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) != CAN_OK)
-  {
-    drawHeader("MCP2515 init FAIL (retry)", RED);
-    delay(300);
-  }
-  CAN.setMode(MCP_NORMAL);
-  drawHeader("MCP2515 init OK", GREEN);
-
+  CAN.setMode(MCP_NORMAL); // 念のためNORMAL
   RS.begin();
+  RS.setMasterId(0xFD); // ★ 参考実機に合う既定
 
-  // Private Ping（応答があればPrivateで生存）
-  bool ok = RS.ping(MOTOR_ID);
-  logLine(ok ? "Ping TX OK" : "Ping TX FAIL", ok ? GREEN : RED);
+  drawLayout();
+  printLine(0, "READY. Mode=%s  (A:Status / B:Demo / C:Next)", modeName(curMode));
+  spr.pushSprite(0, 0);
 }
 
 void loop()
 {
   M5.update();
 
-  // --- ボタン操作 ---
   if (M5.BtnA.wasPressed())
   {
-    bool ok = RS.enable(MOTOR_ID);
-    drawHeader(ok ? "Enable sent" : "Enable FAIL", ok ? GREEN : RED);
-    logLine(ok ? "Enable TX OK" : "Enable TX FAIL", ok ? GREEN : RED);
+    doStatus();
   }
   if (M5.BtnB.wasPressed())
   {
-    bool ok = false;
-    modeState = (modeState + 1) & 0x03; // 0-3を循環（処理前に更新）
-    String modeStr = modeNames[modeState];
-
-    switch (modeState)
+    switch (curMode)
     {
-    case 0: // Position mode (Operation Control)
-    {
-      float pos;
-      switch (posState)
-      {
-      case 0:
-        pos = 0.5f * PI; // +90度
-        break;
-      case 1:
-        pos = 0.0f; // 0度
-        break;
-      case 2:
-        pos = -0.5f * PI; // -90度
-        break;
-      }
-      float vmax = 6.0f, kp = 4.0f, kd = 1.0f;
-      ok = RS.opControl(MOTOR_ID, 0.0f, pos, vmax, kp, kd);
-      logLine(String("Position mode: pos=") + String(pos, 3) + " rad", ok ? CYAN : RED);
-      posState = (posState + 1) % 3; // 0-2を循環
+    case Mode::Velocity:
+      doVelocityDemo();
+      break;
+    case Mode::PP:
+      doPPDemo();
+      break;
+    case Mode::Current:
+      doCurrentDemo();
+      break;
+    case Mode::CSP:
+      doCSPDemo();
+      break;
     }
-    break;
-
-    case 1: // Velocity mode
-    {
-      float velocity;
-      switch (posState)
-      {
-      case 0:
-        velocity = 5.0f; // 5 rad/s
-        break;
-      case 1:
-        velocity = 0.0f; // 0 rad/s (停止)
-        break;
-      case 2:
-        velocity = -5.0f; // -5 rad/s (逆回転)
-        break;
-      }
-      ok = RS.enterVelocityStrict(MOTOR_ID, 8.0f, 10.0f, 20.0f); // 8Nm制限, 10A制限, 20rad/s^2加速度
-      logLine(String("enterVelocityStrict: ") + (ok ? "OK" : "FAIL"), ok ? GREEN : RED);
-      if (ok)
-      {
-        delay(100); // 設定完了を待機
-        ok = RS.velocityRef(MOTOR_ID, velocity);
-        logLine(String("velocityRef: ") + (ok ? "OK" : "FAIL"), ok ? GREEN : RED);
-      }
-      logLine(String("Velocity mode: ") + String(velocity, 1) + " rad/s", ok ? CYAN : RED);
-      posState = (posState + 1) % 3; // 0-2を循環
-    }
-    break;
-
-    case 2: // Current mode
-    {
-      ok = RS.enterCurrent(MOTOR_ID, 5.0f); // 5Nm制限
-      if (ok)
-      {
-        ok = RS.currentIqRef(MOTOR_ID, 2.0f); // 2A
-      }
-      logLine("Current mode: 2.0A", ok ? CYAN : RED);
-    }
-    break;
-
-    case 3: // CSP mode
-    {
-      ok = RS.enterCSP(MOTOR_ID, 5.0f, 10.0f); // 5rad/s制限, 10A制限
-      if (ok)
-      {
-        ok = RS.cspLocRef(MOTOR_ID, 1.0f); // 1 rad位置
-      }
-      logLine("CSP mode: 1.0 rad position", ok ? CYAN : RED);
-    }
-    break;
-    }
-
-    drawHeader(ok ? String("Mode: " + modeStr).c_str() : "Mode FAIL", ok ? CYAN : RED);
-    lastOpMs = millis();
   }
   if (M5.BtnC.wasPressed())
   {
-    bool ok = RS.stop(MOTOR_ID, /*clearFault*/ true);
-    drawHeader(ok ? "Stop + FaultClear" : "Stop FAIL", ok ? 0xFFE0 : RED);
-    logLine(ok ? "Stop&Clear TX OK" : "Stop TX FAIL", ok ? 0xFFE0 : RED);
-  }
-
-  // --- 受信処理 ---
-  RS02PrivFrame f;
-  while (RS.readAny(f))
-  {
-    // フィードバック(Type 2)ならパースして見やすく表示
-    RS02PrivateCAN::Feedback fb;
-    if (RS.parseFeedback(f, fb))
-    {
-      char line[128];
-      snprintf(line, sizeof(line),
-               "[FB] id=%u mode=%u fault=0x%02X  pos=%.3f rad  vel=%.3f  tq=%.3f  T=%.1fC",
-               fb.motorId, fb.mode, fb.faultBits, fb.angleRad, fb.velRadS, fb.torqueNm, fb.tempC);
-      logLine(line, 0x7FFF);
-      // ヘッダにも簡易表示
-      char hdr[64];
-      snprintf(hdr, sizeof(hdr), "FB: pos %.2f rad | vel %.2f | T %.1fC", fb.angleRad, fb.velRadS, fb.tempC);
-      drawHeader(hdr, (fb.faultBits ? RED : GREEN));
-    }
-    else
-    {
-      // その他のフレームは生で表示
-      showRawFrame(f);
-    }
-  }
-
-  // --- 各モードでの継続制御コマンド送信 ---
-  if (millis() - lastOpMs >= 50)
-  { // 50ms間隔で継続送信
-    lastOpMs = millis();
-    bool ok = false;
-
-    switch (modeState)
-    {
-    case 0: // Position mode - 継続送信は不要（一度送信すればOK）
-      break;
-
-    case 1: // Velocity mode - 継続送信が必要
-    {
-      float velocity;
-      switch (posState)
-      {
-      case 0:
-        velocity = 5.0f; // 5 rad/s
-        break;
-      case 1:
-        velocity = 0.0f; // 0 rad/s (停止)
-        break;
-      case 2:
-        velocity = -5.0f; // -5 rad/s (逆回転)
-        break;
-      }
-      ok = RS.velocityRef(MOTOR_ID, velocity);
-      if (!ok)
-      {
-        logLine("Continuous velocityRef FAIL", RED);
-      }
-      else
-      {
-        // デバッグ用：時々継続制御の成功を表示
-        static int debugCounter = 0;
-        if (++debugCounter >= 20)
-        { // 1秒に1回表示
-          logLine(String("Continuous velocity: ") + String(velocity, 1) + " rad/s", GREEN);
-          debugCounter = 0;
-        }
-      }
-    }
-    break;
-
-    case 2: // Current mode - 継続送信が必要
-      ok = RS.currentIqRef(MOTOR_ID, 2.0f);
-      break;
-
-    case 3: // CSP mode - 継続送信が必要
-      ok = RS.cspLocRef(MOTOR_ID, 1.0f);
-      break;
-    }
-
-    if (modeState > 0 && !ok)
-    {
-      logLine("Continuous control FAIL", RED);
-    }
+    curMode = static_cast<Mode>((static_cast<uint8_t>(curMode) + 1) % 4);
+    drawLayout();
+    printLine(0, "Mode changed -> %s", modeName(curMode));
+    spr.pushSprite(0, 0);
   }
 
   delay(5);
