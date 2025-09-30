@@ -3,24 +3,42 @@
 
 #include <M5Unified.h>
 #include <SPI.h>
+#ifdef USE_TWAI
+#include "RS02PrivateTWAI.h"
+#else
 #include <mcp_can.h>
+#include "RS02PrivateCAN.h"
+#endif
 #include <stdarg.h>
 #include <math.h>
-#include "RS02PrivateCAN.h"
 
+#ifndef USE_TWAI
 #define CAN_CS_PIN 6
 #define CAN_BAUD CAN_1000KBPS
 #define MCP_CLOCK MCP_8MHZ // 基板に合わせて 16MHzなら MCP_16MHZ
+#endif
 
 constexpr uint8_t HOST_ID = 0x00;
 constexpr uint8_t MOTOR_ID = 0x7E;
 
+#ifdef USE_TWAI
+// M5AtomS3 default TWAI pins: GPIO2=TX, GPIO1=RX（ビルドフラグで上書き可）
+#ifndef TWAI_TX_GPIO
+#define TWAI_TX_GPIO 2
+#endif
+#ifndef TWAI_RX_GPIO
+#define TWAI_RX_GPIO 1
+#endif
+RS02PrivateTWAI RS(HOST_ID, TWAI_TX_GPIO, TWAI_RX_GPIO);
+#else
 MCP_CAN CAN(CAN_CS_PIN);
 RS02PrivateCAN RS(CAN, HOST_ID);
+#endif
 
 // ===== UI =====
 M5Canvas spr(&M5.Display);
-const int W = 320, H = 240, PAD = 6;
+int W = 320, H = 240;
+const int PAD = 6;
 
 enum class Mode : uint8_t
 {
@@ -88,7 +106,8 @@ static void drawLayout()
     spr.printf("RS02 Monitor  HOST=0x%02X  MOTOR=0x%02X  MASTER=0x%02X\n",
                HOST_ID, MOTOR_ID, RS.masterId());
     spr.setCursor(PAD, PAD + 16);
-    spr.printf("[A] Monitor %s  [B] Demo  [C] Mode=%s\n", monitorOn ? "ON" : "OFF", modeName(curMode));
+    spr.printf("[Btn] Tap:Monitor %s  Hold>=0.7s:Mode  Hold>=1.5s:Demo\n",
+               monitorOn ? "ON" : "OFF");
     spr.drawRect(2, 40, W - 4, 192, 0x7BEF);
 }
 static void printLine(int row, const char *fmt, ...)
@@ -291,14 +310,55 @@ void setup()
     auto cfg = M5.config();
     M5.begin(cfg);
     M5.Display.setTextWrap(false, false);
+    M5.Display.setBrightness(128);
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setCursor(PAD, PAD);
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.println("Booting RS02 Monitor...");
+    Serial.begin(115200);
+    delay(50);
+    Serial.println("[BOOT] RS02 starting");
+
+    // 実機の解像度に合わせてスプライトサイズを決定
+    W = M5.Display.width();
+    H = M5.Display.height();
 
     spr.setColorDepth(8);
     spr.createSprite(W, H);
     spr.setTextWrap(false, false);
     spr.setTextSize(1);
+    spr.fillScreen(BLACK);
+    spr.setCursor(PAD, PAD);
+    spr.setTextColor(WHITE, BLACK);
+    spr.println("Init interfaces...");
+    spr.pushSprite(0, 0);
 
+    // SPIはMCP2515使用時のみ必要
+#ifndef USE_TWAI
     SPI.begin();
+#endif
 
+#ifdef USE_TWAI
+    Serial.printf("[TWAI] init: TX=%d RX=%d\n", (int)TWAI_TX_GPIO, (int)TWAI_RX_GPIO);
+    M5.Display.println("Init TWAI...");
+    if (!RS.begin())
+    {
+        // フォールバックで直接LCDにも表示
+        spr.fillScreen(BLACK);
+        spr.setCursor(PAD, PAD);
+        spr.setTextColor(RED, BLACK);
+        spr.println("TWAI begin FAIL");
+        spr.pushSprite(0, 0);
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(PAD, PAD);
+        M5.Display.setTextColor(RED, BLACK);
+        M5.Display.println("TWAI begin FAIL");
+        Serial.println("[TWAI] begin FAIL");
+        while (1)
+            delay(1000);
+    }
+    Serial.println("[TWAI] begin OK");
+#else
     if (CAN.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) != CAN_OK)
     {
         spr.fillScreen(BLACK);
@@ -306,11 +366,16 @@ void setup()
         spr.setTextColor(RED, BLACK);
         spr.println("CAN.begin FAIL");
         spr.pushSprite(0, 0);
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(PAD, PAD);
+        M5.Display.setTextColor(RED, BLACK);
+        M5.Display.println("CAN.begin FAIL");
         while (1)
             delay(1000);
     }
     CAN.setMode(MCP_NORMAL);
     RS.begin();
+#endif
     RS.setMasterId(0xFD);
 
     // 任意：Type2を有効化（出ない個体もあるが無害）
@@ -326,37 +391,50 @@ void loop()
 {
     M5.update();
 
-    if (M5.BtnA.wasPressed())
+    // AtomS3: 単一ボタン操作
+    static uint32_t holdStart = 0;
+    bool btn = M5.BtnA.isPressed();
+    if (btn && holdStart == 0)
+        holdStart = millis();
+    if (!btn && holdStart != 0)
     {
-        monitorOn = !monitorOn;
-        drawMonitorFrame();
-        if (monitorOn)
-            nextMonUpdate = 0;
-    }
-    if (M5.BtnB.wasPressed())
-    {
-        switch (curMode)
+        uint32_t dur = millis() - holdStart;
+        holdStart = 0;
+        if (dur < 700)
         {
-        case Mode::Velocity:
-            doVelocityDemo();
-            break;
-        case Mode::PP:
-            doPPDemo();
-            break;
-        case Mode::Current:
-            doCurrentDemo();
-            break;
-        case Mode::CSP:
-            doCSPDemo();
-            break;
+            // Tap: Monitor ON/OFF
+            monitorOn = !monitorOn;
+            drawMonitorFrame();
+            if (monitorOn)
+                nextMonUpdate = 0;
         }
-    }
-    if (M5.BtnC.wasPressed())
-    {
-        curMode = static_cast<Mode>((static_cast<uint8_t>(curMode) + 1) % 4);
-        drawLayout();
-        printLine(0, "Mode changed -> %s", modeName(curMode));
-        spr.pushSprite(0, 0);
+        else if (dur < 1500)
+        {
+            // Medium hold: Mode change
+            curMode = static_cast<Mode>((static_cast<uint8_t>(curMode) + 1) % 4);
+            drawLayout();
+            printLine(0, "Mode changed -> %s", modeName(curMode));
+            spr.pushSprite(0, 0);
+        }
+        else
+        {
+            // Long hold: Demo
+            switch (curMode)
+            {
+            case Mode::Velocity:
+                doVelocityDemo();
+                break;
+            case Mode::PP:
+                doPPDemo();
+                break;
+            case Mode::Current:
+                doCurrentDemo();
+                break;
+            case Mode::CSP:
+                doCSPDemo();
+                break;
+            }
+        }
     }
 
     // Monitor: 200ms周期で Type17 読み

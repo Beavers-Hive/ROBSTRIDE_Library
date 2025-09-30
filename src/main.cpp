@@ -3,35 +3,41 @@
 
 #include <M5Unified.h>
 #include <SPI.h>
+#ifdef USE_TWAI
+#include "RS02PrivateTWAI.h"
+#else
 #include <mcp_can.h>
+#include "RS02PrivateCAN.h"
+#endif
 #include <stdarg.h>
 #include <math.h>
-#include "RS02PrivateCAN.h"
 
+#ifndef USE_TWAI
 #define CAN_CS_PIN 6
 #define CAN_BAUD CAN_1000KBPS
 #define MCP_CLOCK MCP_8MHZ // 基板に合わせて 16MHzなら MCP_16MHZ
+#endif
 
 constexpr uint8_t HOST_ID = 0x00;
 constexpr uint8_t MOTOR_ID = 0x7E;
 
+#ifdef USE_TWAI
+// M5AtomS3 default TWAI pins: GPIO2=TX, GPIO1=RX（ビルドフラグで上書き可）
+#ifndef TWAI_TX_GPIO
+#define TWAI_TX_GPIO 2
+#endif
+#ifndef TWAI_RX_GPIO
+#define TWAI_RX_GPIO 1
+#endif
+RS02PrivateTWAI RS(HOST_ID, TWAI_TX_GPIO, TWAI_RX_GPIO);
+#else
 MCP_CAN CAN(CAN_CS_PIN);
 RS02PrivateCAN RS(CAN, HOST_ID);
+#endif
 
-// ===== UI =====
-M5Canvas spr(&M5.Display);
-const int W = 320, H = 240, PAD = 6;
+// ===== Minimal (no UI) =====
 
-enum class Mode : uint8_t
-{
-  Velocity = 0,
-  PP = 1,
-  Current = 2,
-  CSP = 3
-};
-Mode curMode = Mode::Velocity;
-bool monitorOn = true;
-uint32_t nextMonUpdate = 0;
+// No mode switching; IMU-CSP only
 
 // ===== Angle∞ アンラップ =====
 struct AngleTracker
@@ -64,46 +70,7 @@ static inline void angleTrackUpdateFromMechPos(float nowRad)
 }
 
 // ===== 表示ユーティリティ =====
-static const char *modeName(Mode m)
-{
-  switch (m)
-  {
-  case Mode::Velocity:
-    return "Velocity";
-  case Mode::PP:
-    return "PP";
-  case Mode::Current:
-    return "Current";
-  case Mode::CSP:
-    return "CSP";
-  }
-  return "?";
-}
-static void drawLayout()
-{
-  spr.fillScreen(BLACK);
-  spr.setTextSize(1);
-  spr.setTextColor(WHITE, BLACK);
-  spr.setCursor(PAD, PAD);
-  spr.printf("RS02 Monitor  HOST=0x%02X  MOTOR=0x%02X  MASTER=0x%02X\n",
-             HOST_ID, MOTOR_ID, RS.masterId());
-  spr.setCursor(PAD, PAD + 16);
-  spr.printf("[A] Monitor %s  [B] Demo  [C] Mode=%s\n", monitorOn ? "ON" : "OFF", modeName(curMode));
-  spr.drawRect(2, 40, W - 4, 192, 0x7BEF);
-}
-static void printLine(int row, const char *fmt, ...)
-{
-  char buf[240];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  int y = 46 + row * 18;
-  spr.fillRect(6, y - 2, W - 12, 18, BLACK);
-  spr.setCursor(6, y);
-  spr.setTextColor(WHITE, BLACK);
-  spr.print(buf);
-}
+// (UI utilities removed)
 static bool readU8(uint8_t node, uint16_t idx, uint8_t &out)
 {
   uint8_t le[4] = {0};
@@ -127,162 +94,132 @@ static bool writeU8(uint8_t node, uint16_t idx, uint8_t v)
 }
 
 // ===== Monitor（200ms周期で 0x7019/0x701B をType17読出し）=====
-static void drawMonitorFrame()
-{
-  drawLayout();
-  printLine(0, "MONITOR — mechPos(0x7019)/mechVel(0x701B) polling");
-  spr.pushSprite(0, 0);
-}
-static void monitorTick()
-{
-  if (!monitorOn)
-    return;
-
-  uint8_t run = 255;
-  readU8(MOTOR_ID, RS02Idx::RUN_MODE, run);
-
-  float pos = 0.0f, vel = 0.0f, spdRef = 0.0f, locRef = 0.0f, iqRef = 0.0f;
-  bool okPos = readF32(MOTOR_ID, RS02Idx::MECH_POS, pos);
-  bool okVel = readF32(MOTOR_ID, RS02Idx::MECH_VEL, vel);
-  (void)readF32(MOTOR_ID, RS02Idx::SPD_REF, spdRef);
-  (void)readF32(MOTOR_ID, RS02Idx::LOC_REF, locRef);
-  (void)readF32(MOTOR_ID, RS02Idx::IQ_REF, iqRef);
-
-  if (okPos)
-    angleTrackUpdateFromMechPos(pos);
-
-  float limSpd = 0, limCur = 0, limCurOld = 0, limTq = 0, acc = 0;
-  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_SPD, limSpd);
-  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_CUR, limCur);
-  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_CUR_OLD, limCurOld);
-  (void)readF32(MOTOR_ID, RS02Idx::LIMIT_TORQUE, limTq);
-  (void)readF32(MOTOR_ID, RS02Idx::ACC_RAD, acc);
-
-  printLine(1, "Mode=%u(%s)  Vel=%.3f%s rad/s",
-            run, modeName(curMode), vel, okVel ? "" : "?");
-
-  if (gAngle.has)
-  {
-    double turns = gAngle.accRad / (2.0 * M_PI);
-    double deg = gAngle.accRad * (180.0 / M_PI);
-    printLine(2, "Angle∞: pos=%.3f%s  ->  turns=%.1f  rad=%.3f  deg=%.1f",
-              pos, okPos ? "" : "?", turns, gAngle.accRad, deg);
-  }
-  else
-  {
-    printLine(2, "Angle∞: -- (waiting mechPos 0x7019)");
-  }
-
-  printLine(3, "Refs : loc=%.3f  spd=%.3f  iq=%.3f", locRef, spdRef, iqRef);
-  printLine(4, "Limit: I=%.1f IO=%.1f T=%.1f S=%.1f  acc=%.1f", limCur, limCurOld, limTq, limSpd, acc);
-
-  spr.pushSprite(0, 0);
-}
+// monitor removed
 
 // ===== Demo（B）=====
-static void doVelocityDemo()
+// (Demo functions removed)
+
+// ===== IMU-based CSP Control (Yaw stabilization) =====
+static bool gImuReady = false;
+static bool gImuCspActive = false;
+static uint32_t gImuLastTickMs = 0;
+static double gYawRad = 0.0;          // integrated yaw [rad]
+static double gYawRateRadS = 0.0;     // gyro Z [rad/s]
+static double gCspTargetPosRad = 0.0; // motor absolute target [rad]
+
+static void imuInit()
 {
-  drawLayout();
-  int row = 0;
-  const float LIMIT_CUR_A = 5.0f;
-  const float ACC_RAD_S2 = 20.0f;
-  const float SPD_REF = 2.0f;
-
-  bool ok = RS.stop(MOTOR_ID, true);
-  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
-  delay(100);
-  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 2);
-  printLine(row++, "RUN_MODE=2: %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.enable(MOTOR_ID);
-  printLine(row++, "Enable    : %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR, LIMIT_CUR_A);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_CUR_OLD, LIMIT_CUR_A);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::ACC_RAD, ACC_RAD_S2);
-  printLine(row++, "limit_cur(7018/2019)+acc(7022): %s", ok ? "OK" : "NG");
-
-  bool okSpd = true;
-  for (int i = 0; i < 10; i++)
-  {
-    okSpd &= RS.writeFloatParam(MOTOR_ID, RS02Idx::SPD_REF, SPD_REF);
-    delay(20);
-  }
-  printLine(row++, "spd_ref(700A)=%.1f x10 : %s", SPD_REF, okSpd ? "OK" : "NG");
-  spr.pushSprite(0, 0);
+  // Try initialize IMU; M5Unified exposes M5.Imu
+  // begin() が無い環境でも多くは M5.begin で初期化済みのため、存在チェックのみ
+  // ここでは getGyro が成功するかで判定する
+  float gx = 0, gy = 0, gz = 0;
+  M5.Imu.getGyro(&gx, &gy, &gz); // 多くの環境でvoid
+  gImuReady = true;
 }
-static void doPPDemo()
-{
-  drawLayout();
-  int row = 0;
-  const float LIMIT_SPD = 3.0f; // rad/s
-  const float LOC_STEP = 1.57f; // 90deg
 
-  bool ok = RS.stop(MOTOR_ID, true);
-  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
-  delay(100);
-  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 1);
-  printLine(row++, "RUN_MODE=1(PP): %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.enable(MOTOR_ID);
-  printLine(row++, "Enable         : %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_SPD, LIMIT_SPD);
-  printLine(row++, "limit_spd(7017)=%.1f : %s", LIMIT_SPD, ok ? "OK" : "NG");
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LOC_REF, LOC_STEP);
-  delay(150);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LOC_REF, 0.0f);
-  printLine(row++, "loc_ref step: ->%.2f ->0.00 : %s", LOC_STEP, ok ? "OK" : "NG");
-  spr.pushSprite(0, 0);
-}
-static void doCurrentDemo()
+static bool startImuCsp()
 {
-  drawLayout();
-  int row = 0;
-  const float LIMIT_TORQUE = 3.0f; // Nm
-  const float IQ = 0.5f;           // A
-
-  bool ok = RS.stop(MOTOR_ID, true);
-  printLine(row++, "Stop+Clear: %s", ok ? "OK" : "NG");
-  delay(100);
-  ok &= writeU8(MOTOR_ID, RS02Idx::RUN_MODE, 3);
-  printLine(row++, "RUN_MODE=3(Current): %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.enable(MOTOR_ID);
-  printLine(row++, "Enable             : %s", ok ? "OK" : "NG");
-  delay(50);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::LIMIT_TORQUE, LIMIT_TORQUE);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::CUR_KP, 0.17f);
-  ok &= RS.writeFloatParam(MOTOR_ID, RS02Idx::CUR_KI, 0.012f);
-  printLine(row++, "limits/gains: tq=%.1f, cKp=0.17, cKi=0.012 -> %s", LIMIT_TORQUE, ok ? "OK" : "NG");
-
-  ok &= RS.currentIqRef(MOTOR_ID, +IQ);
-  delay(300);
-  ok &= RS.currentIqRef(MOTOR_ID, 0.0f);
-  delay(150);
-  ok &= RS.currentIqRef(MOTOR_ID, -IQ);
-  delay(300);
-  ok &= RS.currentIqRef(MOTOR_ID, 0.0f);
-  printLine(row++, "iq_ref sweep ±%.2f A : %s", IQ, ok ? "OK" : "NG");
-  spr.pushSprite(0, 0);
-}
-static void doCSPDemo()
-{
-  drawLayout();
   int row = 0;
   const float LIMIT_SPD = 6.0f; // rad/s
   const float LIMIT_CUR = 5.0f; // A
-  const float KP_LOC = 5.0f;
-  const float P1 = 1.57f, P2 = 0.0f;
+  const float KP_LOC = 50.0f;
+
+  if (!gImuReady)
+    imuInit();
 
   bool ok = RS.enterCSP_robust(MOTOR_ID, LIMIT_SPD, LIMIT_CUR, KP_LOC);
-  printLine(row++, "CSP robust (RM=5 twice + limits + KP): %s", ok ? "OK" : "NG");
-  bool okRef = true;
-  okRef &= RS.cspLocRef(MOTOR_ID, P1);
-  delay(180);
-  okRef &= RS.cspLocRef(MOTOR_ID, P2);
-  printLine(row++, "loc_ref(7016): 1.57 -> 0.00 : %s", okRef ? "OK" : "NG");
-  spr.pushSprite(0, 0);
+  Serial.printf("IMU-CSP bring-up: %s\n", ok ? "OK" : "NG");
+
+  // 初期目標を現在位置へ
+  float posNow = 0.0f;
+  if (ok && RS.readFloatParam(MOTOR_ID, RS02Idx::MECH_POS, posNow))
+  {
+    gCspTargetPosRad = posNow;
+  }
+  else
+  {
+    gCspTargetPosRad = 0.0;
+  }
+  gYawRad = 0.0;
+  gYawRateRadS = 0.0;
+  gImuLastTickMs = millis();
+  gImuCspActive = ok;
+  Serial.printf("Init pos=%.2f rad  IMU=%s\n", (float)gCspTargetPosRad, gImuReady ? "OK" : "NG");
+  return gImuCspActive;
+}
+
+static void stopImuCsp()
+{
+  gImuCspActive = false;
+}
+
+static void imuCspTick()
+{
+  if (!gImuCspActive)
+    return;
+
+  uint32_t now = millis();
+  float dt = (now - gImuLastTickMs) * 0.001f;
+  if (dt <= 0.0f || dt > 0.1f)
+  {
+    gImuLastTickMs = now;
+    return;
+  }
+  gImuLastTickMs = now;
+
+  // 1) センサ取得（Z軸ジャイロをYaw速度とみなす）
+  float gx = 0, gy = 0, gz = 0;
+  if (gImuReady)
+  {
+    M5.Imu.getGyro(&gx, &gy, &gz);
+    // M5Unifiedはdeg/sのことが多い
+    gYawRateRadS = (double)gz * ((double)M_PI / 180.0);
+    gYawRad += gYawRateRadS * (double)dt;
+  }
+
+  // 2) 制御（PD: u = -Kp*yaw - Kd*dyaw）→ 速度 [rad/s]
+  const double Kp = 2.0; // 調整用
+  const double Kd = 0.05;
+  double uVel = -(Kp * gYawRad + Kd * gYawRateRadS);
+
+  // 3) 速度上限 → 位置へ積分
+  const double VEL_LIMIT = 5.0; // rad/s（motor LIMIT_SPD より少し低め）
+  if (uVel > VEL_LIMIT)
+    uVel = VEL_LIMIT;
+  if (uVel < -VEL_LIMIT)
+    uVel = -VEL_LIMIT;
+  gCspTargetPosRad += uVel * (double)dt;
+
+  // 4) 位置コマンド送出
+  (void)RS.cspLocRef(MOTOR_ID, (float)gCspTargetPosRad);
+
+  // 5) ログ（任意）
+  // Serial.printf("yaw=%.3f rad  dy=%.3f rad/s  tgt=%.2f\n", (float)gYawRad, (float)gYawRateRadS, (float)gCspTargetPosRad);
+}
+
+// ===== Minimal display (small font) =====
+static uint32_t gNextUiMs = 0;
+
+static void updateDisplayTick()
+{
+  if ((int32_t)(millis() - gNextUiMs) < 0)
+    return;
+  gNextUiMs = millis() + 100; // 10Hz
+
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setCursor(2, 2);
+  M5.Display.setTextColor(WHITE, BLACK);
+  M5.Display.setTextSize(1); // smallest
+
+  float yawRad = (float)gYawRad;
+  float yawDeg = yawRad * (180.0f / (float)M_PI);
+  float dy = (float)gYawRateRadS;
+  float tgt = (float)gCspTargetPosRad;
+
+  M5.Display.println("IMU-CSP");
+  M5.Display.printf("yaw=%.2f rad (%.0f°)\n", yawRad, yawDeg);
+  M5.Display.printf("dy=%.2f rs\n", dy);
+  // M5.Display.printf("tgt=%.2f v=%.2f\n", tgt, gLastVelCmd);
 }
 
 // ===== Arduino lifecycle =====
@@ -290,81 +227,48 @@ void setup()
 {
   auto cfg = M5.config();
   M5.begin(cfg);
+  M5.Display.setBrightness(128);
   M5.Display.setTextWrap(false, false);
+  M5.Display.setTextSize(1);
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("[BOOT] IMU-CSP pendulum");
 
-  spr.setColorDepth(8);
-  spr.createSprite(W, H);
-  spr.setTextWrap(false, false);
-  spr.setTextSize(1);
-
+  // SPIはMCP2515使用時のみ必要
+#ifndef USE_TWAI
   SPI.begin();
+#endif
 
+#ifdef USE_TWAI
+  Serial.printf("[TWAI] init: TX=%d RX=%d\n", (int)TWAI_TX_GPIO, (int)TWAI_RX_GPIO);
+  if (!RS.begin())
+  {
+    Serial.println("[TWAI] begin FAIL");
+    while (1)
+      delay(1000);
+  }
+  Serial.println("[TWAI] begin OK");
+#else
   if (CAN.begin(MCP_ANY, CAN_BAUD, MCP_CLOCK) != CAN_OK)
   {
-    spr.fillScreen(BLACK);
-    spr.setCursor(PAD, PAD);
-    spr.setTextColor(RED, BLACK);
-    spr.println("CAN.begin FAIL");
-    spr.pushSprite(0, 0);
+    Serial.println("CAN.begin FAIL");
     while (1)
       delay(1000);
   }
   CAN.setMode(MCP_NORMAL);
   RS.begin();
+#endif
   RS.setMasterId(0xFD);
 
-  // 任意：Type2を有効化（出ない個体もあるが無害）
-  RS.setActiveReport(MOTOR_ID, true);
-  RS.setReportIntervalTicks(MOTOR_ID, 1);
-
-  drawLayout();
-  printLine(0, "READY. Mode=%s  (A:Monitor / B:Demo / C:Next)", modeName(curMode));
-  spr.pushSprite(0, 0);
+  // IMUとCSPを起動
+  imuInit();
+  startImuCsp();
 }
 
 void loop()
 {
   M5.update();
-
-  if (M5.BtnA.wasPressed())
-  {
-    monitorOn = !monitorOn;
-    drawMonitorFrame();
-    if (monitorOn)
-      nextMonUpdate = 0;
-  }
-  if (M5.BtnB.wasPressed())
-  {
-    switch (curMode)
-    {
-    case Mode::Velocity:
-      doVelocityDemo();
-      break;
-    case Mode::PP:
-      doPPDemo();
-      break;
-    case Mode::Current:
-      doCurrentDemo();
-      break;
-    case Mode::CSP:
-      doCSPDemo();
-      break;
-    }
-  }
-  if (M5.BtnC.wasPressed())
-  {
-    curMode = static_cast<Mode>((static_cast<uint8_t>(curMode) + 1) % 4);
-    drawLayout();
-    printLine(0, "Mode changed -> %s", modeName(curMode));
-    spr.pushSprite(0, 0);
-  }
-
-  // Monitor: 200ms周期で Type17 読み
-  if (monitorOn && (int32_t)(millis() - nextMonUpdate) >= 0)
-  {
-    monitorTick();
-    nextMonUpdate = millis() + 200;
-  }
-
-  delay(3);
+  imuCspTick();
+  updateDisplayTick();
+  delay(1);
 }
