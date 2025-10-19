@@ -16,10 +16,10 @@ constexpr uint8_t MOTOR_ID = 0x7E;
 #ifdef USE_TWAI
 // M5AtomS3 など: ビルドフラグ未指定なら既定のTX/RXを使用
 #ifndef TWAI_TX_GPIO
-#define TWAI_TX_GPIO 39
+#define TWAI_TX_GPIO 2
 #endif
 #ifndef TWAI_RX_GPIO
-#define TWAI_RX_GPIO 38
+#define TWAI_RX_GPIO 1
 #endif
 RS02PrivateTWAI RS(HOST_ID, TWAI_TX_GPIO, TWAI_RX_GPIO);
 #else
